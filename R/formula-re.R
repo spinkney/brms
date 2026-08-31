@@ -20,57 +20,65 @@
 #' @param s2z Logical. If \code{TRUE}, use the experimental physical
 #'   sum-to-zero parameterization described in the section
 #'   \dQuote{Physical sum-to-zero effects}. The default is \code{FALSE}.
-#' @param center Logical, a single number in \code{[0, 1]}, \code{"fisher"},
-#'   \code{"auto"}, or \code{NULL}. For ordinary group effects,
+#' @param center Logical, a number, numeric vector or matrix with values in
+#'   \code{[0, 1]}, \code{"auto"}, or \code{NULL}. For ordinary group effects,
 #'   \code{NULL}, \code{FALSE}, and \code{0} retain the existing non-centered
 #'   parameterization, while \code{TRUE} and \code{1} use centered
 #'   coordinates. For S2Z effects, \code{NULL}, \code{TRUE}, and \code{1}
 #'   use centered physical coordinates, while \code{FALSE} and \code{0} use
 #'   non-centered coordinates. Intermediate numbers partially center either
-#'   kind of group effect without changing its statistical model.
+#'   kind of group effect without changing its statistical model. A numeric
+#'   vector supplies one fraction per grouping level and is shared across the
+#'   term's group-level coefficients. A numeric matrix supplies grouping
+#'   levels by group-level coefficients; a one-column matrix is also shared
+#'   across coefficients. Named rows are recommended; otherwise values follow
+#'   the fitted grouping-factor level order. Row and coefficient names, when
+#'   supplied, must match the fitted design. Level-specific inputs use the
+#'   \code{center} orientation, \eqn{\rho=1-w}, where \eqn{w} is the
+#'   non-centering weight in the partial-centering tutorial.
 #'
 #'   For an ordinary Gaussian group-effect vector at level \eqn{j}, let
-#'   \eqn{L_j} be its conditional covariance Cholesky factor and let
-#'   \eqn{\rho_j} contain the centering fractions. The exact map is
-#'   \eqn{u_j=L_j A_j^{-1}q_j}, where
-#'   \eqn{A_j=\mathop{diag}(\rho_j)L_j+
-#'   \mathop{diag}(1-\rho_j)}, with log-Jacobian
-#'   \eqn{\log|L_j|-\log|A_j|}. Student-t effects use the same map conditional
-#'   on their existing scale-mixture variable, which is included in \eqn{L_j}.
-#'   Correlated and independent Gaussian and Student-t \code{gr} blocks are
-#'   eligible. Positive centering is not currently available with \code{by},
-#'   \code{cov}, \code{pw}, multi-membership, or special group coefficients.
+#'   \eqn{L_j} be its conditional covariance Cholesky factor,
+#'   \eqn{R_j=\mathop{diag}(\rho_j)}, and
+#'   \eqn{A_j=R_jL_j+\mathop{diag}(1-\rho_j)}. The exact map is
+#'   \eqn{u_j=L_jA_j^{-1}(q_j-R_j\mu)}, with log-Jacobian
+#'   \eqn{\log|L_j|-\log|A_j|}. The fitted design map constructs \eqn{\mu}
+#'   from population columns representable by the varying-coefficient design,
+#'   including equivalent contrast bases. Thus \code{center = 1} samples total
+#'   group coefficients and \code{center = 0} retains standardized residual
+#'   coordinates. Student-t effects use the same exact map conditional on
+#'   their existing scale-mixture variable. Positive centering is not currently
+#'   available with \code{by}, \code{cov}, \code{pw}, multi-membership,
+#'   special group coefficients, or a conventional S2Z block in the same
+#'   linear predictor.
 #'
-#'   \code{center = "fisher"} chooses level- and coefficient-specific
-#'   fractions by combining the current Gaussian group-effect covariance with
-#'   response-free likelihood information computed in Stan. If \eqn{J_j} is
-#'   the likelihood information for grouping level \eqn{j}, \eqn{\Sigma} is
-#'   the current group covariance, and
+#'   \code{center = "auto"} chooses fixed level- and coefficient-specific
+#'   fractions through a separate precursor fit. The precursor is fully
+#'   non-centered and uses CmdStanR Pathfinder by default; Pathfinder runs
+#'   \code{min(max(1, chains), 4)} paths unless
+#'   \code{pilot_args$num_paths} is supplied. Alternatively,
+#'   \code{autocenter_control(method = "hmc")} requests a separate short HMC
+#'   precursor. Candidate fractions are evaluated only in generated quantities
+#'   and aggregated across precursor draws (by the median by default). The
+#'   resulting matrix is fixed as data for a new final HMC fit with a fresh
+#'   warmup; no centering weight changes during that fit. See
+#'   \code{\link{autocenter_control}} and \code{\link{centering_weights}}.
+#'   The former dynamic spelling \code{center = "fisher"} is not supported.
+#'
+#'   Candidate fractions combine precursor draws of the group covariance with
+#'   likelihood information. If \eqn{J_j} is the likelihood information,
+#'   \eqn{\Sigma} the group covariance, and
 #'   \eqn{V_j=(\Sigma^{-1}+J_j)^{-1}}, the fraction for coefficient \eqn{k}
-#'   is \eqn{\rho_{jk}=1-(V_j)_{kk}/\Sigma_{kk}}. Thus \eqn{\Sigma} supplies
-#'   the prior metric. The rule uses the design and missingness pattern with
-#'   current covariance, scale, and supported likelihood parameters, but never
-#'   observed response values. \code{"auto"} is an alias.
-#'
-#'   Closed-form expected Fisher information is used where available. Other
-#'   supported native likelihood coordinates use positive analytic,
-#'   coarsened-outcome, or moment working information. Most observation-local
-#'   native families and supported categorical, simplex, hurdle,
-#'   zero-inflated, Cox, and Wiener coordinates are covered. Ordinal and
-#'   nonlinear predictors, generalized-extreme-value and custom families,
-#'   finite mixtures, Wiener non-decision time, residual autocorrelation, and
-#'   unsupported response-addition terms are excluded. Student-t group effects
-#'   use their Gaussian reference covariance only to choose the chart; their
-#'   exact target still contains every existing scale-mixture variable.
-#'
-#'   All coefficients sharing an \code{id} must select Fisher centering
-#'   together. For correlated blocks the fractions can depend on coefficient
-#'   order, although the posterior model is unchanged. Each Fisher-centered
-#'   ID must belong to one predictor-local \code{gr} block without structural
-#'   extensions; such blocks in multivariate models require
-#'   \code{set_rescor(FALSE)}.
-#'   Predictions use reconstructed conventional draws and never derive a new
-#'   centering chart from prediction \code{newdata}. This argument does not
+#'   is \eqn{1-(V_j)_{kk}/\Sigma_{kk}}. The calculation uses the design and
+#'   missingness but does not inspect observed response values directly; it
+#'   may nevertheless be data-informed through the precursor posterior draws.
+#'   Closed-form expected information is used where available, with positive
+#'   analytic, coarsened-outcome, or moment working information elsewhere.
+#'   Automatic proposals exclude ordinal and nonlinear predictors. Each
+#'   automatically centered ID must be predictor-local and free of structural
+#'   extensions; predictor-local blocks in multivariate models require
+#'   \code{set_rescor(FALSE)}. Predictions reuse the fitted fixed matrix rather
+#'   than deriving a new chart from \code{newdata}. This argument does not
 #'   center the population-level design matrix.
 #' @param id Optional character string. All group-level terms across the model
 #'   with the same \code{id} will be modeled as correlated (if \code{cor} is
@@ -268,9 +276,11 @@
 #' form5_partial <- count ~ zAge * Trt +
 #'   (1 + zAge * Trt | gr(patient, s2z = TRUE, center = 0.5))
 #'
-#' # choose fractions from response-free likelihood information in Stan
-#' form_fisher <- y ~ x +
-#'   (1 + x | gr(g, s2z = TRUE, center = "fisher"))
+#' # choose fixed fractions with a fully non-centered Pathfinder precursor
+#' form_auto <- y ~ x +
+#'   (1 + x | gr(g, s2z = TRUE, center = "auto"))
+#' # use autocenter_control(pilot_args = list(num_paths = 8)) to override
+#' # the number of Pathfinder paths
 #' }
 #'
 #' @export
@@ -285,28 +295,46 @@ gr <- function(..., by = NULL, cor = TRUE, id = NA, pw = NULL,
   cor <- as_one_logical(cor)
   s2z <- as_one_logical(s2z)
   s2z_center_auto <- FALSE
+  s2z_center_data <- NULL
   if (is.null(center)) {
     s2z_center <- as.numeric(s2z)
   } else if (is.character(center)) {
     center <- as_one_character(center)
-    if (!center %in% c("fisher", "auto")) {
-      stop2("Argument 'center' must be NULL, logical, a number in [0, 1], ",
-            "\"fisher\", or \"auto\".")
+    if (identical(center, "fisher")) {
+      stop2("Dynamic center = \"fisher\" is no longer supported. Use ",
+            "center = \"auto\" to estimate fixed centering weights with ",
+            "a precursor run.")
     }
-    # The numeric value is an internal placeholder. The mode flag ensures it
-    # is never used as the actual group- and coefficient-specific fraction.
-    s2z_center <- 0.5
+    if (!identical(center, "auto")) {
+      stop2("Argument 'center' must be NULL, logical, numeric with values ",
+            "in [0, 1], or \"auto\".")
+    }
+    # The precursor uses the fully non-centered endpoint. Its generated
+    # quantities propose a fixed level-by-coefficient map for the final fit.
+    s2z_center <- 0
     s2z_center_auto <- TRUE
   } else if (is.logical(center)) {
     s2z_center <- as.numeric(as_one_logical(center))
   } else if (is.numeric(center)) {
-    s2z_center <- as_one_numeric(center)
-    if (!is.finite(s2z_center) || s2z_center < 0 || s2z_center > 1) {
-      stop2("Argument 'center' must be a single number in [0, 1].")
+    resolved_auto <- inherits(center, "brmsautocenter_resolved")
+    center_dim <- dim(center)
+    if (!length(center) || (!is.null(center_dim) && length(center_dim) != 2L) ||
+        any(center_dim == 0L) || anyNA(center) || any(!is.finite(center)) ||
+        any(center < 0 | center > 1)) {
+      stop2("Argument 'center' must be numeric with finite values in [0, 1] ",
+            "and, when dimensional, must be a non-empty matrix.")
     }
+    if (length(center) == 1L && !resolved_auto) {
+      s2z_center <- as.numeric(center)
+    } else {
+      # Levels and coefficient names are known only after framing.
+      s2z_center <- 0.5
+      s2z_center_data <- center
+    }
+    s2z_center_auto <- resolved_auto
   } else {
-    stop2("Argument 'center' must be NULL, logical, a number in [0, 1], ",
-          "\"fisher\", or \"auto\".")
+    stop2("Argument 'center' must be NULL, logical, numeric with values ",
+          "in [0, 1], or \"auto\".")
   }
   id <- as_one_character(id, allow_na = TRUE)
   by <- substitute(by)
@@ -336,7 +364,7 @@ gr <- function(..., by = NULL, cor = TRUE, id = NA, pw = NULL,
   allvars <- str2formula(c(groups, byvars, pwvars))
   nlist(
     groups, allvars, label, by, cor, s2z, s2z_center, s2z_center_auto,
-    id, pw, cov, dist, type = ""
+    s2z_center_data, id, pw, cov, dist, type = ""
   )
 }
 
@@ -531,11 +559,14 @@ re_parts <- function(re_terms) {
 
 # split nested group-level terms and check for special effects terms
 # @param re_terms character vector of RE terms in extended lme4 syntax
-split_re_terms <- function(re_terms) {
+split_re_terms <- function(re_terms, envir = parent.frame()) {
   if (!length(re_terms)) {
     return(re_terms)
   }
-  stopifnot(is.character(re_terms))
+  stopifnot(is.character(re_terms), is.environment(envir))
+  eval_envir <- new.env(parent = envir)
+  eval_envir$gr <- gr
+  eval_envir$mm <- mm
 
   # split after grouping factor terms
   re_parts <- re_parts(re_terms)
@@ -595,7 +626,7 @@ split_re_terms <- function(re_terms) {
       # ||-syntax overwrites the 'cor' argument
       rhs_call$cor <- FALSE
     }
-    gcall <- eval(rhs_call)
+    gcall <- eval(rhs_call, envir = eval_envir)
     if (gcall$cor) {
       id <- gsub("\\|", "", re_parts$mid[i])
       if (nzchar(id)) {
@@ -620,11 +651,138 @@ split_re_terms <- function(re_terms) {
   structure(re_terms, type = unlist(type))
 }
 
+# Freeze evaluated gr(center = ...) arguments into a private formula
+# environment before a fitted model is serialized. Formula environments that
+# point at .GlobalEnv do not otherwise carry referenced weight objects into a
+# fresh R session. Replacing only the center expression preserves the formula
+# itself while making its fitted coordinate system self-contained, including
+# for computed expressions rather than simple symbols.
+materialize_re_center <- function(x) {
+  if (is.mvbrmsformula(x)) {
+    x$forms <- lapply(x$forms, materialize_re_center)
+    return(x)
+  }
+  if (is.brmsformula(x)) {
+    x$formula <- materialize_re_center(x$formula)
+    x$pforms <- lapply(x$pforms, materialize_re_center)
+    return(x)
+  }
+  if (!is.formula(x)) {
+    return(x)
+  }
+  source_env <- environment(x)
+  if (is.null(source_env)) {
+    source_env <- parent.frame()
+  }
+  frozen_env <- new.env(parent = source_env)
+  counter <- 0L
+  changed <- FALSE
+  is_gr_call <- function(call) {
+    if (!is.call(call)) {
+      return(FALSE)
+    }
+    head <- call[[1L]]
+    if (identical(head, as.name("gr"))) {
+      return(TRUE)
+    }
+    is.call(head) && length(head) == 3L &&
+      as.character(head[[1L]]) %in% c("::", ":::") &&
+      identical(as.character(head[[3L]]), "gr")
+  }
+  walk <- function(expr) {
+    if (!is.call(expr)) {
+      return(expr)
+    }
+    if (is_gr_call(expr)) {
+      center <- which(names(expr) == "center")
+      if (length(center)) {
+        stopifnot(length(center) == 1L)
+        center_expr <- expr[[center]]
+        # Literal scalar values already make the formula self-contained.
+        if (!is.symbol(center_expr) && !is.call(center_expr)) {
+          return(expr)
+        }
+        value <- eval(center_expr, envir = source_env)
+        if (is.symbol(center_expr)) {
+          # Preserve the user-facing formula for the common `center = rho`
+          # case while shadowing rho with its fitted value in the child env.
+          key <- as.character(center_expr)
+        } else {
+          repeat {
+            counter <<- counter + 1L
+            key <- paste0(".brms_group_center_", counter)
+            if (!exists(key, envir = source_env, inherits = TRUE)) {
+              break
+            }
+          }
+          expr[[center]] <- as.name(key)
+        }
+        assign(key, value, envir = frozen_env)
+        changed <<- TRUE
+      }
+      return(expr)
+    }
+    for (i in seq_along(expr)[-1L]) {
+      expr[[i]] <- walk(expr[[i]])
+    }
+    expr
+  }
+  x[] <- lapply(x, walk)
+  if (!changed) {
+    return(x)
+  }
+  environment(x) <- frozen_env
+  x
+}
+
+# Variables used only to configure gr(center = ...) are formula metadata, not
+# columns required in model data. This distinction matters when update() checks
+# whether a partial formula introduces new predictors.
+re_center_formula_vars <- function(x) {
+  if (is.brmsformula(x)) {
+    return(unique(c(
+      re_center_formula_vars(x$formula),
+      unlist(lapply(x$pforms, re_center_formula_vars), use.names = FALSE)
+    )))
+  }
+  if (!is.formula(x)) {
+    return(character())
+  }
+  out <- character()
+  walk <- function(expr) {
+    if (!is.call(expr)) {
+      return(invisible(NULL))
+    }
+    head <- expr[[1L]]
+    is_gr <- identical(head, as.name("gr")) ||
+      (is.call(head) && length(head) == 3L &&
+       as.character(head[[1L]]) %in% c("::", ":::") &&
+       identical(as.character(head[[3L]]), "gr"))
+    if (is_gr) {
+      center <- which(names(expr) == "center")
+      if (length(center)) {
+        out <<- c(out, all.vars(expr[[center]]))
+      }
+      return(invisible(NULL))
+    }
+    for (i in seq_along(expr)[-1L]) {
+      walk(expr[[i]])
+    }
+    invisible(NULL)
+  }
+  walk(x)
+  unique(out)
+}
+
 # extract group-level terms from a formula of character vector
 # @param x formula or character vector
 # @param formula return a formula rather than a character string?
 # @param brackets include group-level terms in brackets?
 get_re_terms <- function(x, formula = FALSE, brackets = TRUE) {
+  x_env <- if (is.formula(x)) environment(x) else parent.frame()
+  if (is.null(x_env)) {
+    x_env <- parent.frame()
+  }
   if (is.formula(x)) {
     x <- all_terms(x)
   }
@@ -634,7 +792,7 @@ get_re_terms <- function(x, formula = FALSE, brackets = TRUE) {
     out <- paste0("(", out, ")")
   }
   if (formula) {
-    out <- str2formula(out)
+    out <- str2formula(out, env = x_env)
   }
   out
 }
@@ -808,8 +966,8 @@ get_re.btl <- function(x, ...) {
 #   cor: are correlations modeled for this effect?
 #   s2z: use a sum-to-zero parameterization for this effect?
 #   s2z_center: numeric centering fraction for this effect
-#   s2z_center_auto: derive centering fractions from Stan-side expected Fisher
-#     information?
+#   s2z_center_auto: request fixed fractions from an automatic precursor?
+#   s2z_center_data: optional user-supplied level-by-coefficient fractions
 #   ggn: global number of the grouping factor
 #   type: special effects type; can be 'sp' or 'cs'
 #   gcall: output of functions 'gr' or 'mm'
@@ -873,6 +1031,13 @@ frame_re <- function(bterms, data, old_levels = NULL) {
     rdat$bylevels <- repl(bylevels, nrow(rdat))
     rdat$form <- repl(re$form[[i]], nrow(rdat))
     rdat$gcall <- repl(re$gcall[[i]], nrow(rdat))
+    if (nrow(rdat) > 1L &&
+        !is.null(re$gcall[[i]][["s2z_center_data"]])) {
+      # Store a term-level matrix once rather than once per expanded column.
+      for (k in seq_len(nrow(rdat))[-1L]) {
+        rdat$gcall[[k]][["s2z_center_data"]] <- NULL
+      }
+    }
     # prepare group-level IDs
     id <- re$id[[i]]
     if (is.na(id)) {

@@ -527,28 +527,26 @@ test_that("fixed ordinal centering charts retain the local dense system", {
 })
 
 
-test_that("ordinal Fisher charts reject with local predictor context", {
-  forms <- list(
-    fisher = y ~ x + (1 + x | gr(
-      g, id = "ordinal-fisher", s2z = TRUE, center = "fisher"
-    )),
-    auto = y ~ x + (1 + x | gr(
-      g, id = "ordinal-auto", s2z = TRUE, center = "auto"
-    ))
+test_that("ordinal automatic proposals reject with local predictor context", {
+  expect_error(
+    gr(g, s2z = TRUE, center = "fisher"),
+    "Dynamic center.*is no longer supported"
   )
-  for (name in names(forms)) {
-    msg <- s2z_ordinal_error_message(stancode(
-      forms[[name]], data = s2z_ordinal_dat, family = cumulative()
-    ))
-    expect_match(
-      msg, "S2Z capability 'ordinal_fisher_centering'", fixed = TRUE
-    )
-    expect_match(msg, "response 'y'", fixed = TRUE)
-    expect_match(msg, "family 'cumulative'", fixed = TRUE)
-    expect_match(msg, "dpar 'mu'", fixed = TRUE)
-    expect_match(msg, "group 'g'", fixed = TRUE)
-    expect_match(msg, paste0("ID 'ordinal-", name, "'"), fixed = TRUE)
-    expect_match(msg, "coefficient(s) 'Intercept, x'", fixed = TRUE)
-    expect_match(msg, "use a fixed center value in [0, 1]", fixed = TRUE)
-  }
+
+  form <- y ~ x + (1 + x | gr(
+    g, id = "ordinal-auto", s2z = TRUE, center = "auto"
+  ))
+  msg <- s2z_ordinal_error_message(stancode(
+    form, data = s2z_ordinal_dat, family = cumulative()
+  ))
+  expect_match(
+    msg, "S2Z capability 'ordinal_fisher_centering'", fixed = TRUE
+  )
+  expect_match(msg, "response 'y'", fixed = TRUE)
+  expect_match(msg, "family 'cumulative'", fixed = TRUE)
+  expect_match(msg, "dpar 'mu'", fixed = TRUE)
+  expect_match(msg, "group 'g'", fixed = TRUE)
+  expect_match(msg, "ID 'ordinal-auto'", fixed = TRUE)
+  expect_match(msg, "coefficient(s) 'Intercept, x'", fixed = TRUE)
+  expect_match(msg, "use a fixed center value in [0, 1]", fixed = TRUE)
 })

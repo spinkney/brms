@@ -370,9 +370,9 @@ test_that("exact logistic means compose with every S2Z centering chart", {
         (1 + x | gr(g, s2z = TRUE, center = 0.35)),
       family = gaussian(), prior = population_prior
     ),
-    fisher = list(
+    auto = list(
       formula = y ~ x +
-        (1 + x | gr(g, s2z = TRUE, center = "fisher")),
+        (1 + x | gr(g, s2z = TRUE, center = "auto")),
       family = gaussian(), prior = population_prior
     ),
     independent = list(
@@ -382,14 +382,14 @@ test_that("exact logistic means compose with every S2Z centering chart", {
     ),
     Student = list(
       formula = y ~ x + (1 + x | gr(
-        g, s2z = TRUE, dist = "student", center = "fisher"
+        g, s2z = TRUE, dist = "student", center = "auto"
       )),
       family = gaussian(), prior = population_prior
     ),
     multiblock = list(
       formula = y ~ x +
         (1 + x | gr(g, id = "first", s2z = TRUE, center = 0.3)) +
-        (1 | gr(h, id = "second", s2z = TRUE, center = "fisher")),
+        (1 | gr(h, id = "second", s2z = TRUE, center = "auto")),
       family = gaussian(), prior = population_prior
     )
   )
@@ -417,7 +417,7 @@ test_that("exact logistic means compose with every S2Z centering chart", {
     code$partial,
     "matrix<lower=0,upper=1>[N_1, M_1] rho_s2z_1;"
   )
-  expect_match2(code$fisher, "rho_s2z_1[j, k]")
+  expect_match2(code$auto, "rho_s2z_1[j, k]")
   expect_match2(code$independent, "scale_partial_s2z")
   expect_match2(code$Student, "group_scale_s2z_1 = dfm_1;")
   expect_match2(code$Student, "rho_s2z_1[j, k]")
@@ -573,9 +573,13 @@ test_that("Plan 03 surface excludes later S2Z APIs and state", {
   expect_true("center" %in% public_arguments)
   expect_false("scale" %in% public_arguments)
   expect_false("latent" %in% public_arguments)
-  fisher_term <- gr(g, s2z = TRUE, center = "fisher")
-  expect_true(isTRUE(fisher_term$s2z_center_auto))
-  expect_equal(fisher_term$s2z_center, 0.5)
+  expect_error(
+    gr(g, s2z = TRUE, center = "fisher"),
+    "Dynamic center.*is no longer supported"
+  )
+  auto_term <- gr(g, s2z = TRUE, center = "auto")
+  expect_true(isTRUE(auto_term$s2z_center_auto))
+  expect_equal(auto_term$s2z_center, 0)
   expect_error(
     gr(g, s2z = TRUE, scale = "varying"),
     "expects only a single grouping term"

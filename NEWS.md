@@ -2,21 +2,30 @@
 
 ### New Features
 
-* Add exact centered, non-centered, partially centered, and automatic
-parameterizations for ordinary Gaussian and Student-t group effects via
-`gr(..., center = ...)`. The historical default (`NULL`, `FALSE`, or `0`)
-remains non-centered; `TRUE` or `1` selects centered coordinates; and a
-number in `[0, 1]` selects an exact partial chart. Student-t effects use the
-same affine map conditional on their existing scale-mixture variable.
-`center = "fisher"` (with `"auto"` as an alias) chooses response-free,
-level- and coefficient-specific fractions from the current group covariance
-and likelihood information computed in Stan. Fixed centering fractions are
-supported in eligible predictor-local ordinary blocks, including ordinal,
-distributional, nonlinear, categorical, and multivariate models. Fisher
-centering excludes ordinal and nonlinear predictors; predictor-local
-multivariate Fisher blocks require `set_rescor(FALSE)`. Positive ordinary
-centering excludes cross-predictor IDs, `by`, `cov`, `pw`, multi-membership,
-and special group coefficients.
+* Extend `gr(..., center = ...)` for ordinary Gaussian and Student-t group
+effects with exact centered, non-centered, and partial charts. Numeric vectors
+(one value per grouping level) and level-by-coefficient matrices provide fixed
+heterogeneous fractions. The fitted fractions and fixed-to-random design map
+are stored with the model and reused by later new-data calls.
+
+`center = "auto"` estimates fixed level- and coefficient-specific fractions in
+a two-stage workflow. A fully non-centered CmdStanR precursor uses Pathfinder
+by default, or a separate short HMC run selected by `autocenter_control()`.
+Pathfinder runs `min(max(1, chains), 4)` paths by default, so the usual
+four-chain final fit uses four paths; `pilot_args$num_paths` overrides this.
+Candidate fractions are computed only in generated quantities and aggregated
+across precursor draws by the median by default. The final HMC fit receives
+the frozen matrix as data and starts a fresh warmup. The former dynamic
+`center = "fisher"` spelling is no longer supported.
+
+The proposal combines precursor draws of the group covariance with the
+existing expected-information catalog. Fixed fractions support eligible
+ordinal, distributional, nonlinear, categorical, and multivariate
+predictor-local blocks. Automatic proposals exclude ordinal and nonlinear
+predictors; predictor-local multivariate automatic blocks require
+`set_rescor(FALSE)`. Positive ordinary centering excludes cross-predictor IDs,
+`by`, `cov`, `pw`, multi-membership, special group coefficients, and a
+conventional S2Z block in the same linear predictor.
 
 * Add an experimental physical sum-to-zero parameterization via
 `gr(..., s2z = TRUE)` for ordinary matched varying intercepts, numeric and
@@ -51,15 +60,15 @@ Ordinal `threshold = "sum_to_zero"`, fixed or shared ordinal-mixture
 thresholds, category-specific S2Z group effects, and the non-Gaussian
 active-prior fallback (including logistic priors) remain unsupported. The S2Z
 implementation supports `center = FALSE` for exact non-centered coordinates,
-numeric values in `[0, 1]` for exact partial centering, and
-`center = "fisher"` (or `"auto"`) for response-free automatic centering;
-omitting `center` retains the centered physical S2Z chart. Exact logistic
-active-coordinate priors compose with every supported S2Z centering chart.
-Fixed centering is supported for ordinal S2Z location predictors, while
-ordinal Fisher centering remains unavailable. Group scales varying by level
-remain deferred. Structural extensions such as `by`, `cov`, `pw`,
-multi-membership, other special group coefficients, cross-predictor IDs, and
-sparse or QR designs also remain unsupported.
+numeric scalar, level-vector, or level-by-coefficient matrix values for exact
+partial centering, and `center = "auto"` for fixed fractions estimated by the
+same separate precursor workflow. Omitting `center` retains the centered
+physical S2Z chart. Exact logistic active-coordinate priors compose with every
+supported S2Z centering chart. Fixed centering is supported for ordinal S2Z
+location predictors, while automatic proposals remain unavailable there.
+Group scales varying by level remain deferred. Structural extensions such as
+`by`, `cov`, `pw`, multi-membership, other special group coefficients,
+cross-predictor IDs, and sparse or QR designs also remain unsupported.
 (#1916)
 * Specify a prior `tag` for use in prior sensitivity analysis
 via `priorsense` thanks to Kallioinen. (#1585)

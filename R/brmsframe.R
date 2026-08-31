@@ -100,6 +100,9 @@ brmsframe.btl <- function(x, data, frame = list(), basis = NULL, ...) {
   x$frame$re <- subset2(frame$re, ls = check_prefix(x))
   class(x) <- c("bframel", class(x))
   validate_re_s2z_structure(x, data = data)
+  x$frame$re_center_mean <- frame_re_center_mean(
+    x, data = data, cached = basis[["re_center_mean"]]
+  )
   cached_re_s2z <- basis[["re_s2z"]]
   reuse_re_s2z <- has_re_s2z(x) &&
     is.list(cached_re_s2z) && length(cached_re_s2z) &&
@@ -126,7 +129,9 @@ brmsframe.btl <- function(x, data, frame = list(), basis = NULL, ...) {
       }
     }
   }
-  if (reuse_re_s2z && !is.null(basis[["re_s2z_center"]])) {
+  reuse_re_center <- !is.null(basis[["re_s2z_center"]]) &&
+    (!has_re_s2z(x) || reuse_re_s2z)
+  if (reuse_re_center) {
     # Partial-centering fractions are part of the fitted coordinate map. Reuse
     # them for new data rather than deriving a different map at prediction time.
     x$sdata$re_s2z_center <- basis[["re_s2z_center"]]
@@ -433,7 +438,9 @@ frame_basis.btl <- function(x, data, ...) {
   out$sp <- frame_basis_sp(x, data, ...)
   out$ac <- frame_basis_ac(x, data, ...)
   out$bhaz <- frame_basis_bhaz(x, data, ...)
-  if (is.bframel(x) && has_re_s2z(x)) {
+  has_center_data <- is.bframel(x) && has_rows(x$frame$re) &&
+    re_center_has_data(x$frame$re)
+  if (is.bframel(x) && (has_re_s2z(x) || has_center_data)) {
     re_s2z_center <- x$sdata[["re_s2z_center"]]
     if (is.null(re_s2z_center)) {
       re_s2z_center <- data_re_s2z_center(x, data = data)
@@ -444,6 +451,9 @@ frame_basis.btl <- function(x, data, ...) {
     if (is.list(x$frame$re_s2z) && length(x$frame$re_s2z)) {
       out$re_s2z <- x$frame$re_s2z
     }
+  }
+  if (is.bframel(x) && length(x$frame$re_center_mean)) {
+    out$re_center_mean <- x$frame$re_center_mean
   }
   out
 }

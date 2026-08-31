@@ -56,57 +56,65 @@ options are \code{"gaussian"} and \code{"student"}.}
 sum-to-zero parameterization described in the section
 \dQuote{Physical sum-to-zero effects}. The default is \code{FALSE}.}
 
-\item{center}{Logical, a single number in \code{[0, 1]}, \code{"fisher"},
-  \code{"auto"}, or \code{NULL}. For ordinary group effects,
+\item{center}{Logical, a number, numeric vector or matrix with values in
+  \code{[0, 1]}, \code{"auto"}, or \code{NULL}. For ordinary group effects,
   \code{NULL}, \code{FALSE}, and \code{0} retain the existing non-centered
   parameterization, while \code{TRUE} and \code{1} use centered
   coordinates. For S2Z effects, \code{NULL}, \code{TRUE}, and \code{1}
   use centered physical coordinates, while \code{FALSE} and \code{0} use
   non-centered coordinates. Intermediate numbers partially center either
-  kind of group effect without changing its statistical model.
+  kind of group effect without changing its statistical model. A numeric
+  vector supplies one fraction per grouping level and is shared across the
+  term's group-level coefficients. A numeric matrix supplies grouping
+  levels by group-level coefficients; a one-column matrix is also shared
+  across coefficients. Named rows are recommended; otherwise values follow
+  the fitted grouping-factor level order. Row and coefficient names, when
+  supplied, must match the fitted design. Level-specific inputs use the
+  \code{center} orientation, \eqn{\rho=1-w}, where \eqn{w} is the
+  non-centering weight in the partial-centering tutorial.
 
   For an ordinary Gaussian group-effect vector at level \eqn{j}, let
-  \eqn{L_j} be its conditional covariance Cholesky factor and let
-  \eqn{\rho_j} contain the centering fractions. The exact map is
-  \eqn{u_j=L_j A_j^{-1}q_j}, where
-  \eqn{A_j=\mathop{diag}(\rho_j)L_j+
-  \mathop{diag}(1-\rho_j)}, with log-Jacobian
-  \eqn{\log|L_j|-\log|A_j|}. Student-t effects use the same map conditional
-  on their existing scale-mixture variable, which is included in \eqn{L_j}.
-  Correlated and independent Gaussian and Student-t \code{gr} blocks are
-  eligible. Positive centering is not currently available with \code{by},
-  \code{cov}, \code{pw}, multi-membership, or special group coefficients.
+  \eqn{L_j} be its conditional covariance Cholesky factor,
+  \eqn{R_j=\mathop{diag}(\rho_j)}, and
+  \eqn{A_j=R_jL_j+\mathop{diag}(1-\rho_j)}. The exact map is
+  \eqn{u_j=L_jA_j^{-1}(q_j-R_j\mu)}, with log-Jacobian
+  \eqn{\log|L_j|-\log|A_j|}. The fitted design map constructs \eqn{\mu}
+  from population columns representable by the varying-coefficient design,
+  including equivalent contrast bases. Thus \code{center = 1} samples total
+  group coefficients and \code{center = 0} retains standardized residual
+  coordinates. Student-t effects use the same exact map conditional on
+  their existing scale-mixture variable. Positive centering is not currently
+  available with \code{by}, \code{cov}, \code{pw}, multi-membership,
+  special group coefficients, or a conventional S2Z block in the same
+  linear predictor.
 
-  \code{center = "fisher"} chooses level- and coefficient-specific
-  fractions by combining the current Gaussian group-effect covariance with
-  response-free likelihood information computed in Stan. If \eqn{J_j} is
-  the likelihood information for grouping level \eqn{j}, \eqn{\Sigma} is
-  the current group covariance, and
+  \code{center = "auto"} chooses fixed level- and coefficient-specific
+  fractions through a separate precursor fit. The precursor is fully
+  non-centered and uses CmdStanR Pathfinder by default; Pathfinder runs
+  \code{min(max(1, chains), 4)} paths unless
+  \code{pilot_args$num_paths} is supplied. Alternatively,
+  \code{autocenter_control(method = "hmc")} requests a separate short HMC
+  precursor. Candidate fractions are evaluated only in generated quantities
+  and aggregated across precursor draws (by the median by default). The
+  resulting matrix is fixed as data for a new final HMC fit with a fresh
+  warmup; no centering weight changes during that fit. See
+  \code{\link{autocenter_control}} and \code{\link{centering_weights}}.
+  The former dynamic spelling \code{center = "fisher"} is not supported.
+
+  Candidate fractions combine precursor draws of the group covariance with
+  likelihood information. If \eqn{J_j} is the likelihood information,
+  \eqn{\Sigma} the group covariance, and
   \eqn{V_j=(\Sigma^{-1}+J_j)^{-1}}, the fraction for coefficient \eqn{k}
-  is \eqn{\rho_{jk}=1-(V_j)_{kk}/\Sigma_{kk}}. Thus \eqn{\Sigma} supplies
-  the prior metric. The rule uses the design and missingness pattern with
-  current covariance, scale, and supported likelihood parameters, but never
-  observed response values. \code{"auto"} is an alias.
-
-  Closed-form expected Fisher information is used where available. Other
-  supported native likelihood coordinates use positive analytic,
-  coarsened-outcome, or moment working information. Most observation-local
-  native families and supported categorical, simplex, hurdle,
-  zero-inflated, Cox, and Wiener coordinates are covered. Ordinal and
-  nonlinear predictors, generalized-extreme-value and custom families,
-  finite mixtures, Wiener non-decision time, residual autocorrelation, and
-  unsupported response-addition terms are excluded. Student-t group effects
-  use their Gaussian reference covariance only to choose the chart; their
-  exact target still contains every existing scale-mixture variable.
-
-  All coefficients sharing an \code{id} must select Fisher centering
-  together. For correlated blocks the fractions can depend on coefficient
-  order, although the posterior model is unchanged. Each Fisher-centered
-  ID must belong to one predictor-local \code{gr} block without structural
-  extensions; such blocks in multivariate models require
-  \code{set_rescor(FALSE)}.
-  Predictions use reconstructed conventional draws and never derive a new
-  centering chart from prediction \code{newdata}. This argument does not
+  is \eqn{1-(V_j)_{kk}/\Sigma_{kk}}. The calculation uses the design and
+  missingness but does not inspect observed response values directly; it
+  may nevertheless be data-informed through the precursor posterior draws.
+  Closed-form expected information is used where available, with positive
+  analytic, coarsened-outcome, or moment working information elsewhere.
+  Automatic proposals exclude ordinal and nonlinear predictors. Each
+  automatically centered ID must be predictor-local and free of structural
+  extensions; predictor-local blocks in multivariate models require
+  \code{set_rescor(FALSE)}. Predictions reuse the fitted fixed matrix rather
+  than deriving a new chart from \code{newdata}. This argument does not
   center the population-level design matrix.}
 }
 \description{
@@ -236,7 +244,7 @@ internal IDs, or specify eligible non-reference category predictors with a
 distinct ID for each one.
 
 S2Z coordinates can be centered, non-centered, partially centered, or use
-automatic Fisher centering through the \code{center} argument. Group-level
+automatic precursor centering through the \code{center} argument. Group-level
 scales that vary across grouping levels and priors on realized
 level-specific scales remain deferred.
 
@@ -291,9 +299,11 @@ form5_nc <- count ~ zAge * Trt +
 form5_partial <- count ~ zAge * Trt +
   (1 + zAge * Trt | gr(patient, s2z = TRUE, center = 0.5))
 
-# choose fractions from response-free likelihood information in Stan
-form_fisher <- y ~ x +
-  (1 + x | gr(g, s2z = TRUE, center = "fisher"))
+# choose fixed fractions with a fully non-centered Pathfinder precursor
+form_auto <- y ~ x +
+  (1 + x | gr(g, s2z = TRUE, center = "auto"))
+# use autocenter_control(pilot_args = list(num_paths = 8)) to override
+# the number of Pathfinder paths
 }
 
 }

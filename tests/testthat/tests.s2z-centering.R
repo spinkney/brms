@@ -286,49 +286,6 @@ context("Centering transformations for physical S2Z effects")
   )
 }
 
-# Check the complete moving chart when the scalar Fisher fraction depends on
-# the sampled group scale.  The output retains log(tau), so the full Jacobian
-# is block triangular even though every latent coordinate depends on tau.
-.s2z_dynamic_fisher_case <- function(z, log_tau, information) {
-  n <- length(z) + 1L
-  stopifnot(
-    n >= 2L, length(information) == n,
-    all(is.finite(information)), all(information >= 0),
-    is.finite(log_tau)
-  )
-  basis <- .s2z_basis(n)
-  chart <- function(x) {
-    tau <- exp(x[n])
-    rho <- tau^2 * information / (1 + tau^2 * information)
-    d <- 1 - rho + rho * tau
-    raw <- tau * drop(basis %*% x[seq_len(n - 1L)]) / d
-    effects <- raw - mean(raw)
-    c(drop(crossprod(basis, effects)), x[n])
-  }
-
-  x <- c(z, log_tau)
-  step <- 2e-6 * pmax(1, abs(x))
-  jacobian <- vapply(seq_len(n), function(j) {
-    upper <- lower <- x
-    upper[j] <- upper[j] + step[j]
-    lower[j] <- lower[j] - step[j]
-    (chart(upper) - chart(lower)) / (2 * step[j])
-  }, numeric(n))
-  tau <- exp(log_tau)
-  rho <- tau^2 * information / (1 + tau^2 * information)
-  d <- 1 - rho + rho * tau
-  list(
-    rho = rho,
-    d = d,
-    jacobian = jacobian,
-    numeric_log_jacobian = as.numeric(
-      determinant(jacobian, logarithm = TRUE)$modulus
-    ),
-    formula_log_jacobian =
-      (n - 1L) * log_tau - sum(log(d)) + log(mean(d))
-  )
-}
-
 # Mirror the diagonal-only Fisher contraction emitted by the Stan generator.
 # If C C' = I + L' J L and W = C^-1 L', then the desired posterior covariance
 # is W' W, so its diagonal is available without forming either inverse.
@@ -494,29 +451,6 @@ test_that("exact logistic S2Z means compose with every centering chart", {
     )$determinant_correction,
     -(n - 1L) * sum(log(diag(L_cor))), tolerance = 2e-14
   )
-})
-
-test_that("sampled Fisher fractions retain the exact triangular Jacobian", {
-  z <- sin(seq_len(6L) * 0.43) - cos(seq_len(6L) * 0.71)
-  information <- c(0, 0.03, 0.2, 0.75, 2.4, 11, 80)
-  for (log_tau in log(c(0.08, 0.55, 1, 2.8, 9))) {
-    ans <- .s2z_dynamic_fisher_case(z, log_tau, information)
-
-    expect_true(all(ans$rho >= 0 & ans$rho <= 1))
-    expect_equal(
-      ans$numeric_log_jacobian, ans$formula_log_jacobian,
-      tolerance = 2e-9, scale = 1
-    )
-    # The final output is the unchanged global log-scale. Consequently the
-    # lower-left block is zero and no d rho / d log(tau) determinant term is
-    # missing from the conditional S2Z correction.
-    expect_equal(
-      ans$jacobian[nrow(ans$jacobian), seq_len(ncol(ans$jacobian) - 1L)],
-      numeric(ncol(ans$jacobian) - 1L), tolerance = 2e-10
-    )
-    expect_equal(ans$jacobian[nrow(ans$jacobian), ncol(ans$jacobian)], 1,
-                 tolerance = 2e-10)
-  }
 })
 
 test_that("diagonal-only Fisher reliabilities equal the dense contraction", {
