@@ -594,12 +594,13 @@ split_re_terms <- function(re_terms) {
     new_lhs <- NULL
     # prepare effects of special terms
     valid_types <- c("sp", "cs", "mmc")
-    invalid_types <- c("sm", "gp")
+    invalid_types <- c("sm", "gp", "fm")
     for (t in c(valid_types, invalid_types)) {
       lhs_tform <- do_call(paste0("terms_", t), list(lhs_form))
       if (is.formula(lhs_tform)) {
         if (t %in% invalid_types) {
-          stop2("Cannot handle splines or GPs in group-level terms.")
+          stop2("Cannot handle splines, GPs, or factorization machines ",
+                "in group-level terms.")
         }
         new_lhs <- c(new_lhs, formula2str(lhs_tform, rm = 1))
         type[[i]] <- c(type[[i]], t)

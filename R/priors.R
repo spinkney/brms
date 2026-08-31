@@ -239,7 +239,23 @@
 #'   consider other priors as well to make sure inference is robust to the prior
 #'   specification. If tuning fails, a half-normal prior is used instead.
 #'
-#'   6. Autocorrelation parameters
+#'   6. Factorization machines
+#'
+#'   Factorization-machine terms specified with \code{\link{fm}} have a
+#'   non-negative marginal interaction scale of class \code{sdfm}. A prior for
+#'   one term can be selected using its ordered field label as \code{coef}, for
+#'   example \code{set_prior("normal(0, 1)", class = "sdfm",
+#'   coef = "user:item")}. When \code{main = TRUE}, each field also has a
+#'   non-negative marginal main-effect scale of class \code{sdfm_main},
+#'   selected using \code{group}, for example
+#'   \code{set_prior("normal(0, 1)", class = "sdfm_main", group = "user")}.
+#'   Both classes use the default prior for scale parameters. The native
+#'   sum-to-zero main-effect vectors and the Gaussian Householder-reflector
+#'   coordinates have fixed standard-normal priors. The ordered interaction
+#'   spectrum has a fixed uniform prior on its squared-energy gaps. These
+#'   internal priors cannot currently be set separately.
+#'
+#'   7. Autocorrelation parameters
 #'
 #'   The autocorrelation parameters currently implemented are named \code{ar}
 #'   (autoregression), \code{ma} (moving average), \code{sderr} (standard
@@ -255,7 +271,7 @@
 #'   between \code{0} and \code{1}. The default priors are flat over the
 #'   respective definition areas.
 #'
-#'   7. Parameters of measurement error terms
+#'   8. Parameters of measurement error terms
 #'
 #'   Latent variables induced via measurement error \code{\link{me}} terms
 #'   require both mean and standard deviation parameters, whose prior classes
@@ -265,7 +281,7 @@
 #'   \code{"corme"} class. All of the above parameters have flat priors over
 #'   their respective definition spaces by default.
 #'
-#'   8. Distance parameters of monotonic effects
+#'   9. Distance parameters of monotonic effects
 #'
 #'   As explained in the details section of \code{\link{brm}},
 #'   monotonic effects make use of a special parameter vector to
@@ -290,7 +306,7 @@
 #'   prior (i.e. \code{<vector> = rep(1, K-1)}) over all simplexes
 #'   of the respective dimension.
 #'
-#'   9. Parameters for specific families
+#'   10. Parameters for specific families
 #'
 #'   Some families need additional parameters to be estimated.
 #'   Families \code{gaussian}, \code{student}, \code{skew_normal},
@@ -324,7 +340,7 @@
 #'   having only minimal influence on the estimations,
 #'   while improving convergence and sampling efficiency.
 #'
-#'   10. Shrinkage priors
+#'   11. Shrinkage priors
 #'
 #'   To reduce the danger of overfitting in models with many predictor terms fit
 #'   on comparably sparse data, brms supports special shrinkage priors, namely
@@ -340,7 +356,7 @@
 #'   \code{sdcar} (SD of spatial CAR structures), \code{sd} (SD of varying
 #'   coefficients).
 #'
-#'   11. Fixing parameters to constants
+#'   12. Fixing parameters to constants
 #'
 #'   Fixing parameters to constants is possible by using the \code{constant}
 #'   function, for example, \code{constant(1)} to fix a parameter to 1.
@@ -734,8 +750,35 @@ prior_predictor.bframel <- function(x, ...) {
     prior_cs(x, ...) +
     prior_sm(x, ...) +
     prior_gp(x, ...) +
+    prior_fm(x, ...) +
     prior_ac(x, ...) +
     prior_bhaz(x, ...)
+}
+
+# Default priors for factorization-machine amplitudes.
+prior_fm <- function(bframe, def_scale_prior, ...) {
+  stopifnot(is.bframel(bframe))
+  prior <- empty_prior()
+  fmframe <- bframe$frame$fm
+  if (!has_rows(fmframe)) {
+    return(prior)
+  }
+  px <- check_prefix(bframe)
+  prior <- prior +
+    brmsprior(def_scale_prior, class = "sdfm", lb = "0", ls = px) +
+    brmsprior(class = "sdfm", coef = fmframe$label, ls = px)
+  use_main <- fmframe$main
+  if (any(use_main)) {
+    groups <- unique(c(
+      fmframe$group1[use_main], fmframe$group2[use_main]
+    ))
+    prior <- prior +
+      brmsprior(
+        def_scale_prior, class = "sdfm_main", lb = "0", ls = px
+      ) +
+      brmsprior(class = "sdfm_main", group = groups, ls = px)
+  }
+  prior
 }
 
 # priors for non-linear predictor terms

@@ -28,6 +28,24 @@ test_that("exclude_pars returns expected parameter names", {
   ep <- brms:::exclude_pars(fit)
   expect_true("zs_1_1" %in% ep)
 
+  fit <- brm(
+    y ~ fm(g, h, k = 2), dat, empty = TRUE, backend = "mock"
+  )
+  ep <- brms:::exclude_pars(fit)
+  expect_true(all(c(
+    "zfm_frame_1_1", "zfm_frame_1_2", "zfm_spectrum_1"
+  ) %in% ep))
+  expect_false(any(c("Qfm_1_1", "Qfm_1_2", "fm_singular_1") %in% ep))
+
+  fit <- brm(
+    y ~ fm(g, h, k = 2), dat, empty = TRUE,
+    save_pars = save_pars(all = TRUE), backend = "mock"
+  )
+  ep <- brms:::exclude_pars(fit)
+  expect_false(any(c(
+    "zfm_frame_1_1", "zfm_frame_1_2", "zfm_spectrum_1"
+  ) %in% ep))
+
   fit <- brm(bf(y ~ eta, eta ~ x1 + s(x2), nl = TRUE), dat, empty = TRUE)
   ep <- brms:::exclude_pars(fit)
   expect_true("zs_eta_1_1" %in% ep)

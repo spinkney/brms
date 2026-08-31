@@ -312,6 +312,7 @@ conditional_effects.brmsfit <- function(x, effects = NULL, conditions = NULL,
     function(x) if (is.numeric(x)) sort(x, TRUE) else x
   )
   int_vars <- get_int_vars(bterms)
+  fm_vars <- get_fm_vars(bterms)
   group_vars <- get_group_vars(bterms)
   out <- list()
   for (i in seq_along(effects)) {
@@ -319,7 +320,7 @@ conditional_effects.brmsfit <- function(x, effects = NULL, conditions = NULL,
     cond_data <- prepare_cond_data(
       mf[, eff, drop = FALSE], conditions = conditions,
       int_conditions = int_conditions, int_vars = int_vars,
-      group_vars = group_vars, surface = surface,
+      group_vars = group_vars, factor_vars = fm_vars, surface = surface,
       resolution = resolution, reorder = use_def_effects
     )
     if (surface && length(eff) == 2L && too_far > 0) {
@@ -550,7 +551,8 @@ get_all_effects.btl <- function(x, ...) {
   c(get_var_combs(x[["fe"]], x[["cs"]]),
     get_all_effects_type(x, "sp"),
     get_all_effects_type(x, "sm"),
-    get_all_effects_type(x, "gp"))
+    get_all_effects_type(x, "gp"),
+    get_all_effects_type(x, "fm"))
 }
 
 # extract variable combinations from special terms
@@ -652,6 +654,10 @@ ordinal_probs_continuous <- function(x) {
 make_conditions <- function(x, vars, ...) {
   # rev ensures that the last variable varies fastest in expand.grid
   vars <- rev(as.character(vars))
+  fm_vars <- NULL
+  if (is.brmsfit(x)) {
+    fm_vars <- get_fm_vars(brmsterms(x$formula))
+  }
   if (!is.data.frame(x) && "data" %in% names(x)) {
     x <- x$data
   }
@@ -659,7 +665,7 @@ make_conditions <- function(x, vars, ...) {
   out <- named_list(vars)
   for (v in vars) {
     tmp <- get(v, x)
-    if (is_like_factor(tmp)) {
+    if (is_like_factor(tmp) || v %in% fm_vars) {
       tmp <- levels(as.factor(tmp))
     } else {
       tmp <- mean(tmp, na.rm = TRUE) + (-1:1) * sd(tmp, na.rm = TRUE)
@@ -770,10 +776,17 @@ prepare_conditions <- function(fit, conditions = NULL, effects = NULL,
   # use sensible default values for unspecified variables
   subset_vars <- get_ad_vars(bterms, "subset")
   int_vars <- get_int_vars(bterms)
+  fm_vars <- get_fm_vars(bterms)
   group_vars <- get_group_vars(bterms)
   req_vars <- setdiff(req_vars, group_vars)
   for (v in req_vars) {
-    if (is_like_factor(mf[[v]])) {
+    if (v %in% fm_vars && !v %in% subset_vars) {
+      # FM fields are categorical even when stored as integer identifiers.
+      # Use an observed level rather than a mean or rounded median, either of
+      # which can be invalid for nonconsecutive identifiers.
+      observed <- mf[[v]][!is.na(mf[[v]])]
+      conditions[[v]] <- observed[1L]
+    } else if (is_like_factor(mf[[v]])) {
       # factor-like variable
       if (v %in% subset_vars) {
         # avoid unintentional subsetting of newdata (#755)
@@ -821,17 +834,20 @@ prepare_conditions <- function(fit, conditions = NULL, effects = NULL,
 # @param int_conditions see argument 'int_conditions' of conditional_effects
 # @param int_vars names of variables being treated as integers
 # @param group_vars names of grouping variables
+# @param factor_vars additional variables to treat as categorical
 # @param surface generate surface plots later on?
 # @param resolution number of distinct points at which to evaluate
 #   the predictors of interest
 # @param reorder reorder predictors so that numeric ones come first?
 prepare_cond_data <- function(data, conditions, int_conditions = NULL,
                               int_vars = NULL, group_vars = NULL,
+                              factor_vars = NULL,
                               surface = FALSE, resolution = 100,
                               reorder = TRUE) {
   effects <- names(data)
   stopifnot(length(effects) %in% c(1L, 2L))
-  is_factor <- ulapply(data, is_like_factor) | names(data) %in% group_vars
+  is_factor <- ulapply(data, is_like_factor) |
+    names(data) %in% c(group_vars, factor_vars)
   types <- ifelse(is_factor, "factor", "numeric")
   # numeric effects should come first
   if (reorder) {

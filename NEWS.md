@@ -2,6 +2,19 @@
 
 ### New Features
 
+* Add two-field factorization-machine terms via
+`fm(field1, field2, k, main = TRUE)`. The interaction uses Seth Axen's
+MIT-licensed Stan Householder-reflector transform to construct centered
+semi-orthogonal frames, together with an ordered unit-norm singular spectrum;
+optional field main effects use
+`sum_to_zero_vector`. This SVD-style parameterization removes continuous
+factor rotations and permutations almost surely while retaining the harmless
+paired-sign ambiguity. The interaction rank and full-table RMS scale are
+controlled explicitly, incomplete field combinations are supported, and
+predictions may use new combinations of levels observed during fitting.
+Factorization-machine terms require the `cmdstanr` backend with CmdStan 2.36
+or newer.
+
 * Add experimental sum-to-zero parameterizations via
 `gr(..., s2z = TRUE)` for hierarchical models with varying intercepts, slopes,
 and interactions. It analytically integrates out the omitted common

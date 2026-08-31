@@ -166,6 +166,12 @@ models for all parameters of the assumed response distribution.
   However, they are computationally demanding and are thus not recommended
   for very large datasets or approximations need to be used.
 
+  Two-field factorization-machine interactions can be fitted using
+  \code{\link{fm}} in the \code{pterms} part of the model formula.
+  Factorization machines replace a full categorical interaction with a
+  centered, SVD-style low-rank interaction using semi-orthogonal frames,
+  while optionally including sum-to-zero main effects for both fields.
+
   The \code{pterms} and \code{gterms} parts may contain four non-standard
   effect types namely monotonic, measurement error, missing value, and
   category specific effects, which can be specified using terms of the

@@ -95,6 +95,7 @@ brmsframe.btl <- function(x, data, frame = list(), basis = NULL, ...) {
   x$frame$sm <- frame_sm(x)
   x$frame$sp <- frame_sp(x, data = data)
   x$frame$gp <- frame_gp(x, data = data)
+  x$frame$fm <- frame_fm(x, data = data, basis = basis$fm)
   x$frame$ac <- frame_ac(x, data = data)
   # only store the ranefs of this specific linear formula
   x$frame$re <- subset2(frame$re, ls = check_prefix(x))
@@ -379,6 +380,7 @@ frame_basis.btl <- function(x, data, ...) {
   out <- list()
   out$sm <- frame_basis_sm(x, data, ...)
   out$gp <- frame_basis_gp(x, data, ...)
+  out$fm <- frame_basis_fm(x, data, ...)
   out$sp <- frame_basis_sp(x, data, ...)
   out$ac <- frame_basis_ac(x, data, ...)
   out$bhaz <- frame_basis_bhaz(x, data, ...)

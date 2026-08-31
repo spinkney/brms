@@ -111,6 +111,7 @@ Other contributors:
   \item Luiz Carvalho [contributor]
   \item Sermet Pekin [contributor]
   \item Florence Bockting [contributor]
+  \item Seth Axen \email{seth@sethaxen.com} (Author of the semi-orthogonal transform code) [contributor]
 }
 
 }

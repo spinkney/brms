@@ -117,6 +117,7 @@ stancode.default <- function(object, data, family = gaussian(),
   normalize <- as_one_logical(normalize)
   parse <- as_one_logical(parse)
   backend <- match.arg(backend, backend_choices())
+  validate_fm_backend(bterms, backend = backend)
   silent <- as_one_logical(silent)
   validate_re_s2z(bterms, prior = prior, stanvars = stanvars)
   scode_predictor <- stan_predictor(
@@ -216,11 +217,19 @@ stancode.default <- function(object, data, family = gaussian(),
   scode_predictor[["model_lik"]] <-
     wsp_per_line(scode_predictor[["model_lik"]], 2)
 
-  # get all priors added to 'lprior'
-  scode_tpar_prior <- paste0(
+  # Get user priors that may also be sampled in generated quantities.
+  scode_rng_prior <- paste0(
     scode_predictor[["tpar_prior"]],
     scode_re[["tpar_prior"]],
     scode_Xme[["tpar_prior"]]
+  )
+  # Fixed internal priors contribute to the saved log-prior density but must
+  # not be interpreted as requests for separate prior RNG variables.
+  scode_tpar_prior <- paste0(
+    scode_rng_prior,
+    scode_predictor[["tpar_prior_no_rng"]],
+    scode_re[["tpar_prior_no_rng"]],
+    scode_Xme[["tpar_prior_no_rng"]]
   )
 
   # generate functions block
@@ -266,7 +275,7 @@ stancode.default <- function(object, data, family = gaussian(),
   )
   # prepare additional sampling from priors
   scode_rngprior <- stan_rngprior(
-    tpar_prior = scode_tpar_prior,
+    tpar_prior = scode_rng_prior,
     par_declars = scode_parameters,
     gen_quantities = scode_predictor[["gen_def"]],
     special_prior = attr(prior, "special"),

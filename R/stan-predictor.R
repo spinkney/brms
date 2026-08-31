@@ -17,6 +17,7 @@ stan_predictor.bframel <- function(x, ...) {
     stan_cs(x, ...),
     stan_sm(x, ...),
     stan_gp(x, ...),
+    stan_fm(x, ...),
     stan_ac(x, ...),
     stan_offset(x, ...),
     stan_bhaz(x, ...)
@@ -1101,11 +1102,12 @@ stan_re_s2z_fisher_reference_eta <- function(bfl, n = "n") {
   unsupported <- function(detail) {
     stop2("Fisher centering for S2Z group-level effects ", detail, ".")
   }
-  special <- c("cs", "sm", "sp", "gp")
+  special <- c("cs", "sm", "sp", "gp", "fm")
   if (any(vapply(special, function(x) has_rows(bfl$frame[[x]]), logical(1)))) {
     unsupported(paste0(
       "currently requires a population-only reference predictor without ",
-      "category-specific, smooth, spatial, or Gaussian-process terms"
+      "category-specific, smooth, spatial, Gaussian-process, or ",
+      "factorization-machine terms"
     ))
   }
   fe <- bfl$frame$fe
@@ -7457,6 +7459,159 @@ stan_sp <- function(bframe, prior, stanvars, threads, normalize, ...) {
       comment = "special effects coefficients",
       normalize = normalize
     )
+  }
+  out
+}
+
+# Stan code for centered SVD-style two-field factorization machines.
+stan_fm <- function(bframe, prior, threads, normalize, ...) {
+  stopifnot(is.bframel(bframe))
+  out <- list()
+  fmframe <- bframe$frame$fm
+  if (!has_rows(fmframe)) {
+    return(out)
+  }
+  str_add(out$fun) <- "  #include 'fun_semiorthogonal_fm.stan'\n"
+  # Initialize this element explicitly to avoid partial matching against
+  # 'tpar_prior_const' when an FM scale has a constant prior.
+  out$tpar_prior <- ""
+  px <- check_prefix(bframe)
+  p <- usc(combine_prefix(px))
+  resp <- usc(px$resp)
+  n <- stan_nn(threads)
+  for (i in seq_rows(fmframe)) {
+    pi <- paste0(p, "_", i)
+    N1 <- paste0("Nfm", pi, "_1")
+    N2 <- paste0("Nfm", pi, "_2")
+    K <- paste0("Kfm", pi)
+    S1 <- paste0("Sfm", pi, "_1")
+    S2 <- paste0("Sfm", pi, "_2")
+    M1 <- paste0("Mfm", pi, "_1")
+    M2 <- paste0("Mfm", pi, "_2")
+    J1 <- paste0("Jfm", pi, "_1")
+    J2 <- paste0("Jfm", pi, "_2")
+    C <- paste0("Cfm", pi)
+    zframe1 <- paste0("zfm_frame", pi, "_1")
+    zframe2 <- paste0("zfm_frame", pi, "_2")
+    zspectrum <- paste0("zfm_spectrum", pi)
+    frame1 <- paste0("Qfm", pi, "_1")
+    frame2 <- paste0("Qfm", pi, "_2")
+    singular <- paste0("fm_singular", pi)
+    sdlatent <- paste0("sdfm", pi)
+
+    str_add(out$data) <- glue(
+      "  int<lower=2> {N1};  // number of levels in first FM field\n",
+      "  int<lower=2> {N2};  // number of levels in second FM field\n",
+      "  int<lower=1> {K};  // effective rank of the FM interaction\n",
+      "  int<lower=0,upper=1> {S1};  // first-frame SO restriction\n",
+      "  int<lower=0,upper=1> {S2};  // second-frame SO restriction\n",
+      "  int<lower=0> {M1};  // first-frame reflector coordinates\n",
+      "  int<lower=0> {M2};  // second-frame reflector coordinates\n",
+      "  array[N{resp}] int<lower=1,upper={N1}> {J1};\n",
+      "  array[N{resp}] int<lower=1,upper={N2}> {J2};\n",
+      "  real<lower=0> {C};  // unit-marginal interaction normalization\n"
+    )
+    str_add(out$par) <- glue(
+      "  vector[{M1}] {zframe1};",
+      "  // Gaussian coordinates of the first FM frame\n",
+      "  vector[{M2}] {zframe2};",
+      "  // Gaussian coordinates of the second FM frame\n",
+      "  simplex[{K}] {zspectrum};",
+      "  // gaps in the ordered FM energy spectrum\n"
+    )
+    str_add(out$tpar_def) <- glue(
+      "  matrix[{N1}, {K}] {frame1} = ",
+      "fm_centered_semiorthogonal_constrain_brms(",
+      "{zframe1}, {N1}, {K}, {S1});\n",
+      "  matrix[{N2}, {K}] {frame2} = ",
+      "fm_centered_semiorthogonal_constrain_brms(",
+      "{zframe2}, {N2}, {K}, {S2});\n",
+      "  vector[{K}] {singular};",
+      "  // descending unit-norm singular spectrum\n",
+      "  for (r in 1:{K}) {{\n",
+      "    real fm_energy = 0;\n",
+      "    for (j in r:{K}) {{\n",
+      "      fm_energy += {zspectrum}[j] / j;\n",
+      "    }}\n",
+      "    {singular}[r] = sqrt(fm_energy);\n",
+      "  }}\n"
+    )
+    str_add_list(out) <- stan_prior(
+      prior, class = "sdfm", coef = fmframe$label[i],
+      suffix = pi, px = px, normalize = normalize,
+      comment = "marginal scale of the FM interaction"
+    )
+    str_add(out$loopeta) <- glue(
+      " + {sdlatent} * {C} * dot_product(",
+      "{frame1}[{J1}{n}] .* to_row_vector({singular}), ",
+      "{frame2}[{J2}{n}])"
+    )
+    str_add(out$pll_args) <- glue(
+      ", data array[] int {J1}, data array[] int {J2}, data real {C}, ",
+      "matrix {frame1}, matrix {frame2}, vector {singular}, real {sdlatent}"
+    )
+
+    if (normalize) {
+      str_add(out$tpar_prior_no_rng) <- glue(
+        "  lprior += std_normal_lpdf({zframe1});\n",
+        "  lprior += std_normal_lpdf({zframe2});\n",
+        "  lprior += dirichlet_lpdf({zspectrum} | rep_vector(1, {K}));\n"
+      )
+    } else {
+      str_add(out$tpar_prior_no_rng) <- glue(
+        "  lprior += std_normal_lupdf({zframe1});\n",
+        "  lprior += std_normal_lupdf({zframe2});\n",
+        "  lprior += dirichlet_lupdf({zspectrum} | rep_vector(1, {K}));\n"
+      )
+    }
+
+    if (fmframe$main[i]) {
+      Cmain1 <- paste0("Cfm_main", pi, "_1")
+      Cmain2 <- paste0("Cfm_main", pi, "_2")
+      zmain1 <- paste0("zfm_main", pi, "_1")
+      zmain2 <- paste0("zfm_main", pi, "_2")
+      sdmain1 <- paste0("sdfm_main", pi, "_1")
+      sdmain2 <- paste0("sdfm_main", pi, "_2")
+      str_add(out$data) <- glue(
+        "  real<lower=0> {Cmain1};  // first-field S2Z normalization\n",
+        "  real<lower=0> {Cmain2};  // second-field S2Z normalization\n"
+      )
+      str_add(out$par) <- glue(
+        "  sum_to_zero_vector[{N1}] {zmain1};",
+        "  // standardized first-field FM main effects\n",
+        "  sum_to_zero_vector[{N2}] {zmain2};",
+        "  // standardized second-field FM main effects\n"
+      )
+      str_add_list(out) <- stan_prior(
+        prior, class = "sdfm_main", group = fmframe$group1[i],
+        suffix = paste0(pi, "_1"), px = px, normalize = normalize,
+        comment = "marginal scale of the first FM main effect"
+      )
+      str_add_list(out) <- stan_prior(
+        prior, class = "sdfm_main", group = fmframe$group2[i],
+        suffix = paste0(pi, "_2"), px = px, normalize = normalize,
+        comment = "marginal scale of the second FM main effect"
+      )
+      str_add(out$loopeta) <- glue(
+        " + {sdmain1} * {Cmain1} * {zmain1}[{J1}{n}]",
+        " + {sdmain2} * {Cmain2} * {zmain2}[{J2}{n}]"
+      )
+      str_add(out$pll_args) <- glue(
+        ", data real {Cmain1}, data real {Cmain2}, ",
+        "vector {zmain1}, vector {zmain2}, real {sdmain1}, real {sdmain2}"
+      )
+      if (normalize) {
+        str_add(out$tpar_prior_no_rng) <- glue(
+          "  lprior += std_normal_lpdf({zmain1}) + 0.5 * log(2 * pi());\n",
+          "  lprior += std_normal_lpdf({zmain2}) + 0.5 * log(2 * pi());\n"
+        )
+      } else {
+        str_add(out$tpar_prior_no_rng) <- glue(
+          "  lprior += std_normal_lupdf({zmain1});\n",
+          "  lprior += std_normal_lupdf({zmain2});\n"
+        )
+      }
+    }
   }
   out
 }

@@ -1,0 +1,13 @@
+"dataset","metric","value"
+"simulation_1","theta_mean_rmse_between",0.0222228355661328
+"simulation_1","theta_mean_cor_between",0.999983847687024
+"simulation_1","interaction_mean_rmse_between",0.0216946251856371
+"simulation_1","interaction_mean_cor_between",0.999928083085878
+"simulation_1","mean_abs_theta_difference_over_quadrature_sd",0.0209036393735946
+"simulation_1","elpd_loo_semi_minus_repo",0.59313938401192
+"simulation_2","theta_mean_rmse_between",0.02367313993215
+"simulation_2","theta_mean_cor_between",0.999986068941373
+"simulation_2","interaction_mean_rmse_between",0.02323033752894
+"simulation_2","interaction_mean_cor_between",0.999940351624304
+"simulation_2","mean_abs_theta_difference_over_quadrature_sd",0.0229627972318133
+"simulation_2","elpd_loo_semi_minus_repo",2.68354415744579

@@ -72,11 +72,71 @@ data_predictor.btl <- function(x, data, data2 = list(), prior = brmsprior(),
     data_cs(x, data),
     data_sm(x, data),
     data_gp(x, data),
+    data_fm(x, data),
     data_ac(x, data, data2 = data2),
     data_offset(x, data),
     data_bhaz(x, data, data2 = data2, prior = prior)
   )
   c(out) <- data_special_prior(x, data, prior = prior, sdata = c(sdata, out))
+  out
+}
+
+# Prepare field indices and normalization constants for factorization machines.
+data_fm <- function(bframe, data) {
+  stopifnot(is.bframel(bframe))
+  if (!is.null(bframe$sdata$fm)) {
+    return(bframe$sdata$fm)
+  }
+  out <- list()
+  p <- usc(combine_prefix(bframe))
+  fmframe <- bframe$frame$fm
+  for (i in seq_rows(fmframe)) {
+    pi <- paste0(p, "_", i)
+    values1 <- get_fm_values(fmframe$field1[i], data)
+    values2 <- get_fm_values(fmframe$field2[i], data)
+    levels1 <- fmframe$levels1[[i]]
+    levels2 <- fmframe$levels2[[i]]
+    J1 <- as.integer(as_factor(values1, levels = levels1))
+    J2 <- as.integer(as_factor(values2, levels = levels2))
+    if (anyNA(J1) || anyNA(J2)) {
+      unknown1 <- unique(as.character(values1[is.na(J1)]))
+      unknown2 <- unique(as.character(values2[is.na(J2)]))
+      unknown <- c(unknown1, unknown2)
+      stop2(
+        "New levels are not yet supported for factorization-machine fields. ",
+        "Unknown level", str_if(length(unknown) != 1L, "s"), ": ",
+        collapse_comma(unknown)
+      )
+    }
+    N1 <- length(levels1)
+    N2 <- length(levels2)
+    k <- fmframe$k[i]
+    # If a centered frame is square, restrict at most one frame to SO(K).
+    # The other frame then retains both determinant signs, so no interaction
+    # surfaces are excluded while a redundant orientation component is removed.
+    # When both centered frames are square, their remaining relative sign is a
+    # physical disconnected component controlled by the unrestricted frame.
+    special1 <- as.integer(k == N1 - 1L)
+    special2 <- as.integer(!special1 && k == N2 - 1L)
+    out[[paste0("Nfm", pi, "_1")]] <- N1
+    out[[paste0("Nfm", pi, "_2")]] <- N2
+    out[[paste0("Kfm", pi)]] <- k
+    out[[paste0("Sfm", pi, "_1")]] <- special1
+    out[[paste0("Sfm", pi, "_2")]] <- special2
+    out[[paste0("Mfm", pi, "_1")]] <- as.integer(
+      (N1 - 1L) * k - k * (k - 1L) / 2L - special1
+    )
+    out[[paste0("Mfm", pi, "_2")]] <- as.integer(
+      (N2 - 1L) * k - k * (k - 1L) / 2L - special2
+    )
+    out[[paste0("Jfm", pi, "_1")]] <- as.array(J1)
+    out[[paste0("Jfm", pi, "_2")]] <- as.array(J2)
+    if (fmframe$main[i]) {
+      out[[paste0("Cfm_main", pi, "_1")]] <- sqrt(N1 / (N1 - 1))
+      out[[paste0("Cfm_main", pi, "_2")]] <- sqrt(N2 / (N2 - 1))
+    }
+    out[[paste0("Cfm", pi)]] <- sqrt(N1 * N2)
+  }
   out
 }
 

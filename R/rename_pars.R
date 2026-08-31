@@ -100,6 +100,7 @@ rename_predictor.bframel <- function(x, ...) {
     rename_cs(x, ...),
     rename_sp(x, ...),
     rename_gp(x, ...),
+    rename_fm(x, ...),
     rename_ac(x, ...))
 }
 
@@ -330,6 +331,43 @@ rename_gp <- function(bframe, pars, ...) {
         zgp_new <- paste0(zgp, "_", sfx1)
         fnames <- paste0(zgp_new, "[", seq_len(sum(zgp_pos)), "]")
         lc(out) <- rlist(zgp_pos, fnames)
+      }
+    }
+  }
+  out
+}
+
+# helps in renaming factorization-machine scales and invariant spectra
+rename_fm <- function(bframe, pars, ...) {
+  stopifnot(is.bframel(bframe))
+  out <- list()
+  p <- usc(combine_prefix(bframe), "prefix")
+  fmframe <- bframe$frame$fm
+  for (i in seq_rows(fmframe)) {
+    old <- paste0("sdfm", p, "_", i)
+    new <- paste0("sdfm", p, "_", fmframe$label[i])
+    pos <- pars == old
+    lc(out) <- rlist(pos, new)
+    c(out) <- rename_prior(old, pars, new_class = new)
+
+    old_singular <- paste0("fm_singular", p, "_", i)
+    new_singular <- paste0("sifm", p, "_", fmframe$label[i])
+    singular_pos <- grepl(paste0("^", old_singular, "\\["), pars)
+    if (any(singular_pos)) {
+      singular_names <- paste0(
+        new_singular, "[", seq_len(sum(singular_pos)), "]"
+      )
+      lc(out) <- rlist(singular_pos, singular_names)
+    }
+
+    if (fmframe$main[i]) {
+      for (j in 1:2) {
+        old <- paste0("sdfm_main", p, "_", i, "_", j)
+        group <- fmframe[[paste0("group", j)]][i]
+        new <- paste0("sdfm_main", p, "_", group)
+        pos <- pars == old
+        lc(out) <- rlist(pos, new)
+        c(out) <- rename_prior(old, pars, new_class = new)
       }
     }
   }
@@ -631,9 +669,11 @@ reorder_pars <- function(x) {
   all_classes <- unique(c(
     "b", "bs", "bsp", "bcs", "ar", "ma", "sderr", "lagsar", "errorsar", "car",
     "rhocar", "sdcar", "cosy", "cortime", "sd", "cor", "df", "sds", "sdgp",
+    "sdfm", "sifm",
     "lscale", valid_dpars(x), "hs", "R2D2", "sdb", "sdbsp", "sdbs", "sdar",
     "sdma", "lncor", "Intercept", "tmp", "rescor", "delta", "simo", "r", "s",
-    "zgp", "rcar", "sbhaz", "Ymi", "Yl", "meanme", "sdme", "corme", "Xme",
+    "zgp", "zfm", "rcar", "sbhaz", "Ymi", "Yl", "meanme", "sdme", "corme",
+    "Xme",
     "prior", "lprior", "lp"
   ))
   # reorder parameter classes

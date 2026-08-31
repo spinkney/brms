@@ -44,11 +44,6 @@ See 'Details' for other valid parameter classes.}
 
 \item{group}{Grouping factor for group-level parameters.}
 
-\item{level}{Grouping-factor level for level-specific parameters. Currently
-only supported for additional priors of class \code{"sd_level"} on
-realized scales in sum-to-zero group-level terms with
-\code{scale = "varying"}.}
-
 \item{resp}{Name of the response variable.
 Only used in multivariate models.}
 
@@ -71,6 +66,11 @@ Used for selectively checking sensitivity of priors in \code{priorsense}.}
 should be checked for validity (as far as possible).
 Defaults to \code{TRUE}. If \code{FALSE}, \code{prior} is passed
 to the Stan code as is, and all other arguments are ignored.}
+
+\item{level}{Grouping-factor level for level-specific parameters. Currently
+only supported for additional priors of class \code{"sd_level"} on
+realized scales in sum-to-zero group-level terms with
+\code{scale = "varying"}.}
 
 \item{...}{Arguments passed to \code{set_prior}.}
 }
@@ -220,27 +220,27 @@ Define priors for specific parameters or classes of parameters.
   coefficient-specific priors in the same way, for example
   \code{set_prior("normal(0, 0.2)", class = "sdlog", group = "g",
   coef = "x1")}. The ordinary class \code{sd} remains the baseline
-(conditional median) scale. Class \code{sdlog} has a half-normal
-\code{normal(0, 0.25)} default; fixing it to zero with
-\code{constant(0)} gives the shared-scale model. Realized per-level scales
-are deterministic hierarchy draws named \code{sd_level}. Additional prior
-information can be supplied for selected scales using class
-\code{sd_level} together with \code{group}, \code{coef}, and \code{level},
-for example \code{set_prior("lognormal(log(0.5), 0.2)",
-class = "sd_level", group = "g", coef = "Intercept", level = "A")}.
-This multiplies the existing hierarchical prior by the specified density
-evaluated at the selected realized scale; it does not replace the
-\code{sd}/\code{sdlog} hierarchy and requires no Jacobian. These additional
-factors must be nonempty continuous distribution priors. Constant and
-special shrinkage priors, tags, and explicit \code{lb}/\code{ub} bounds
-are not supported. Custom distributions are allowed when they provide the
-continuous density and any truncation-normalization functions required by
-the generated Stan code (typically an \code{_lccdf} function when
-normalization is enabled). The user is responsible for ensuring that the
-density is proper and has appropriate support for a positive scale. For
-scalability,
-\code{default_prior} reports one \code{sd_level} availability row per
-group-level coefficient; specify the desired fitted-data level explicitly.
+  (conditional median) scale. Class \code{sdlog} has a half-normal
+  \code{normal(0, 0.25)} default; fixing it to zero with
+  \code{constant(0)} gives the shared-scale model. Realized per-level scales
+  are deterministic hierarchy draws named \code{sd_level}. Additional prior
+  information can be supplied for selected scales using class
+  \code{sd_level} together with \code{group}, \code{coef}, and \code{level},
+  for example \code{set_prior("lognormal(log(0.5), 0.2)",
+  class = "sd_level", group = "g", coef = "Intercept", level = "A")}.
+  This multiplies the existing hierarchical prior by the specified density
+  evaluated at the selected realized scale; it does not replace the
+  \code{sd}/\code{sdlog} hierarchy and requires no Jacobian. These additional
+  factors must be nonempty continuous distribution priors. Constant and
+  special shrinkage priors, tags, and explicit \code{lb}/\code{ub} bounds
+  are not supported. Custom distributions are allowed when they provide the
+  continuous density and any truncation-normalization functions required by
+  the generated Stan code (typically an \code{_lccdf} function when
+  normalization is enabled). The user is responsible for ensuring that the
+  density is proper and has appropriate support for a positive scale. For
+  scalability,
+  \code{default_prior} reports one \code{sd_level} availability row per
+  group-level coefficient; specify the desired fitted-data level explicitly.
 
   If there is more than one group-level effect per grouping factor,
   the correlations between those effects have to be estimated.
@@ -284,7 +284,23 @@ group-level coefficient; specify the desired fitted-data level explicitly.
   consider other priors as well to make sure inference is robust to the prior
   specification. If tuning fails, a half-normal prior is used instead.
 
-  6. Autocorrelation parameters
+  6. Factorization machines
+
+  Factorization-machine terms specified with \code{\link{fm}} have a
+  non-negative marginal interaction scale of class \code{sdfm}. A prior for
+  one term can be selected using its ordered field label as \code{coef}, for
+  example \code{set_prior("normal(0, 1)", class = "sdfm",
+  coef = "user:item")}. When \code{main = TRUE}, each field also has a
+  non-negative marginal main-effect scale of class \code{sdfm_main},
+  selected using \code{group}, for example
+  \code{set_prior("normal(0, 1)", class = "sdfm_main", group = "user")}.
+  Both classes use the default prior for scale parameters. The native
+  sum-to-zero main-effect vectors and the Gaussian Householder-reflector
+  coordinates have fixed standard-normal priors. The ordered interaction
+  spectrum has a fixed uniform prior on its squared-energy gaps. These
+  internal priors cannot currently be set separately.
+
+  7. Autocorrelation parameters
 
   The autocorrelation parameters currently implemented are named \code{ar}
   (autoregression), \code{ma} (moving average), \code{sderr} (standard
@@ -300,7 +316,7 @@ group-level coefficient; specify the desired fitted-data level explicitly.
   between \code{0} and \code{1}. The default priors are flat over the
   respective definition areas.
 
-  7. Parameters of measurement error terms
+  8. Parameters of measurement error terms
 
   Latent variables induced via measurement error \code{\link{me}} terms
   require both mean and standard deviation parameters, whose prior classes
@@ -310,7 +326,7 @@ group-level coefficient; specify the desired fitted-data level explicitly.
   \code{"corme"} class. All of the above parameters have flat priors over
   their respective definition spaces by default.
 
-  8. Distance parameters of monotonic effects
+  9. Distance parameters of monotonic effects
 
   As explained in the details section of \code{\link{brm}},
   monotonic effects make use of a special parameter vector to
@@ -335,7 +351,7 @@ group-level coefficient; specify the desired fitted-data level explicitly.
   prior (i.e. \code{<vector> = rep(1, K-1)}) over all simplexes
   of the respective dimension.
 
-  9. Parameters for specific families
+  10. Parameters for specific families
 
   Some families need additional parameters to be estimated.
   Families \code{gaussian}, \code{student}, \code{skew_normal},
@@ -369,7 +385,7 @@ group-level coefficient; specify the desired fitted-data level explicitly.
   having only minimal influence on the estimations,
   while improving convergence and sampling efficiency.
 
-  10. Shrinkage priors
+  11. Shrinkage priors
 
   To reduce the danger of overfitting in models with many predictor terms fit
   on comparably sparse data, brms supports special shrinkage priors, namely
@@ -385,7 +401,7 @@ group-level coefficient; specify the desired fitted-data level explicitly.
   \code{sdcar} (SD of spatial CAR structures), \code{sd} (SD of varying
   coefficients).
 
-  11. Fixing parameters to constants
+  12. Fixing parameters to constants
 
   Fixing parameters to constants is possible by using the \code{constant}
   function, for example, \code{constant(1)} to fix a parameter to 1.

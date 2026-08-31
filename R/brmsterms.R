@@ -266,7 +266,7 @@ terms_lf <- function(formula) {
   y$allvars <- allvars_formula(
     get_allvars(y$fe), get_allvars(y$re),
     get_allvars(y$cs), get_allvars(y$sp),
-    get_allvars(y$sm), get_allvars(y$gp),
+    get_allvars(y$sm), get_allvars(y$gp), get_allvars(y$fm),
     get_allvars(y$ac), get_allvars(y$offset)
   )
   structure(y, class = "btl")
@@ -641,7 +641,7 @@ as.brmsterms <- function(x) {
 
 # names of supported term types
 all_term_types <- function() {
-  c("fe", "re", "sp", "cs", "sm", "gp", "ac", "offset")
+  c("fe", "re", "sp", "cs", "sm", "gp", "fm", "ac", "offset")
 }
 
 # avoid ambiguous parameter names
@@ -838,7 +838,7 @@ has_special_terms <- function(x) {
   if (!is.btl(x)) {
     return(FALSE)
   }
-  special_terms <- c("sp", "sm", "gp", "ac", "cs", "offset")
+  special_terms <- c("sp", "sm", "gp", "fm", "ac", "cs", "offset")
   NROW(x[["re"]]) > 0 || any(lengths(x[special_terms]))
 }
 
@@ -946,11 +946,13 @@ all_terms <- function(x) {
 # @param type one or more special term types to be extracted
 # TODO: rule out expressions such as mi(y) + mi(x)
 regex_sp <- function(type = "all") {
-  choices <- c("all", "sp", "sm", "gp", "cs", "mmc", "ac", all_sp_types())
+  choices <- c(
+    "all", "sp", "sm", "gp", "fm", "cs", "mmc", "ac", all_sp_types()
+  )
   type <- unique(match.arg(type, choices, several.ok = TRUE))
   funs <- c(
     sm = "(s|(t2)|(te)|(ti))",
-    gp = "gp", cs = "cse?", mmc = "mmc",
+    gp = "gp", fm = "fm", cs = "cse?", mmc = "mmc",
     ac = "((arma)|(ar)|(ma)|(cosy)|(unstr)|(sar)|(car)|(fcor))"
   )
   funs[all_sp_types()] <- all_sp_types()

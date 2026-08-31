@@ -230,9 +230,73 @@ prepare_predictions.bframel <- function(x, draws, sdata, ...) {
   out$cs <- prepare_predictions_cs(x, draws, sdata, ...)
   out$sm <- prepare_predictions_sm(x, draws, sdata, ...)
   out$gp <- prepare_predictions_gp(x, draws, sdata, ...)
+  out$fm <- prepare_predictions_fm(x, draws, sdata, ...)
   out$re <- prepare_predictions_re(x, sdata, ...)
   out$ac <- prepare_predictions_ac(x, draws, sdata, nat_cov = FALSE, ...)
   out$offset <- prepare_predictions_offset(x, sdata, ...)
+  out
+}
+
+# Prepare posterior factors and field indices for factorization machines.
+prepare_predictions_fm <- function(bframe, draws, sdata, ...) {
+  stopifnot(is.bframel(bframe))
+  fmframe <- bframe$frame$fm
+  if (!has_rows(fmframe)) {
+    return(list())
+  }
+  p <- usc(combine_prefix(bframe))
+  pp <- usc(combine_prefix(bframe), "prefix")
+  ndraws <- nrow(draws)
+  out <- named_list(fmframe$label)
+  for (i in seq_along(out)) {
+    pi <- paste0(p, "_", i)
+    N1 <- sdata[[paste0("Nfm", pi, "_1")]]
+    N2 <- sdata[[paste0("Nfm", pi, "_2")]]
+    k <- sdata[[paste0("Kfm", pi)]]
+    term <- list(
+      J1 = sdata[[paste0("Jfm", pi, "_1")]],
+      J2 = sdata[[paste0("Jfm", pi, "_2")]],
+      C = sdata[[paste0("Cfm", pi)]],
+      sd = as.vector(prepare_draws(
+        draws, paste0("sdfm", pp, "_", fmframe$label[i])
+      ))
+    )
+    term$frame1 <- prepare_draws(
+      draws, paste0("^Qfm", pi, "_1\\["), regex = TRUE
+    )
+    term$frame2 <- prepare_draws(
+      draws, paste0("^Qfm", pi, "_2\\["), regex = TRUE
+    )
+    term$singular <- prepare_draws(
+      draws,
+      paste0(
+        "^sifm", pp, "_", escape_all(fmframe$label[i]), "\\["
+      ),
+      regex = TRUE
+    )
+    dim(term$frame1) <- c(ndraws, N1, k)
+    dim(term$frame2) <- c(ndraws, N2, k)
+    dim(term$singular) <- c(ndraws, k)
+    if (fmframe$main[i]) {
+      term$Cmain1 <- sdata[[paste0("Cfm_main", pi, "_1")]]
+      term$Cmain2 <- sdata[[paste0("Cfm_main", pi, "_2")]]
+      term$sdmain1 <- as.vector(prepare_draws(
+        draws, paste0("sdfm_main", pp, "_", fmframe$group1[i])
+      ))
+      term$sdmain2 <- as.vector(prepare_draws(
+        draws, paste0("sdfm_main", pp, "_", fmframe$group2[i])
+      ))
+      term$main1 <- prepare_draws(
+        draws, paste0("^zfm_main", pi, "_1\\["), regex = TRUE
+      )
+      term$main2 <- prepare_draws(
+        draws, paste0("^zfm_main", pi, "_2\\["), regex = TRUE
+      )
+      dim(term$main1) <- c(ndraws, N1)
+      dim(term$main2) <- c(ndraws, N2)
+    }
+    out[[i]] <- term
+  }
   out
 }
 

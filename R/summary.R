@@ -61,7 +61,8 @@ summary.brmsfit <- function(object, priors = FALSE, prob = 0.95,
     "b", "bs", "bcs", "bsp", "bmo", "bme", "bmi", "bm",
     valid_dpars(object), "delta", "lncor", "rescor", "ar", "ma", "sderr",
     "cosy", "cortime", "lagsar", "errorsar", "car", "sdcar", "rhocar",
-    "sd", "sdlog", "cor", "df", "sds", "sdgp", "lscale", "simo"
+    "sd", "sdlog", "cor", "df", "sds", "sdgp", "sdfm", "sifm",
+    "lscale", "simo"
   )
   incl_regex <- paste0("^", regex_or(incl_classes), "(_|$|\\[)")
   variables <- variables[grepl(incl_regex, variables)]
@@ -232,6 +233,26 @@ summary.brmsfit <- function(object, priors = FALSE, prob = 0.95,
     rownames(out$gp) <- gsub("^lscale_", "lscale(", rownames(out$gp))
     rownames(out$gp) <- paste0(rownames(out$gp), ")")
   }
+  # summary of factorization machines
+  fm_pars <- variables[grepl("^(sdfm(_main)?|sifm)_", variables)]
+  if (length(fm_pars)) {
+    out$fm <- full_summary[fm_pars, , drop = FALSE]
+    fm_names <- rownames(out$fm)
+    is_main <- grepl("^sdfm_main_", fm_names)
+    is_singular <- grepl("^sifm_", fm_names)
+    fm_names[is_main] <- sub(
+      "^sdfm_main_", "sdfm_main(", fm_names[is_main]
+    )
+    is_scale <- !is_main & !is_singular
+    fm_names[is_scale] <- sub("^sdfm_", "sdfm(", fm_names[is_scale])
+    fm_names[is_main | is_scale] <- paste0(
+      fm_names[is_main | is_scale], ")"
+    )
+    fm_names[is_singular] <- sub(
+      "\\[", ")[", sub("^sifm_", "sifm(", fm_names[is_singular])
+    )
+    rownames(out$fm) <- fm_names
+  }
   out
 }
 
@@ -298,6 +319,11 @@ print.brmssummary <- function(x, digits = 2,
   if (length(x$gp)) {
     cat("Gaussian Process Hyperparameters:\n")
     print_format(x$gp, digits)
+    cat("\n")
+  }
+  if (length(x$fm)) {
+    cat("Factorization Machine Hyperparameters:\n")
+    print_format(x$fm, digits)
     cat("\n")
   }
   if (nrow(x$cor_pars)) {

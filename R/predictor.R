@@ -23,12 +23,42 @@ predictor.bprepl <- function(prep, i = NULL, fprep = NULL, ...) {
     predictor_sp(prep, i) +
     predictor_sm(prep, i) +
     predictor_gp(prep, i) +
+    predictor_fm(prep, i) +
     predictor_offset(prep, i, nobs)
   # some autocorrelation structures depend on eta
   eta <- predictor_ac(eta, prep, i, fprep = fprep)
   # intentionally last as it may return 3D arrays
   eta <- predictor_cs(eta, prep, i)
   unname(eta)
+}
+
+# Compute factorization-machine contributions to the linear predictor.
+predictor_fm <- function(prep, i = NULL) {
+  if (!length(prep[["fm"]])) {
+    return(0)
+  }
+  obs <- i %||% seq_len(prep$nobs)
+  eta <- matrix(0, nrow = prep$ndraws, ncol = length(obs))
+  for (term in prep[["fm"]]) {
+    J1 <- term$J1[obs]
+    J2 <- term$J2[obs]
+    interaction <- matrix(0, nrow = prep$ndraws, ncol = length(obs))
+    for (j in seq_len(dim(term$frame1)[3L])) {
+      frame1 <- term$frame1[, J1, j, drop = FALSE]
+      frame2 <- term$frame2[, J2, j, drop = FALSE]
+      dim(frame1) <- dim(frame2) <- c(prep$ndraws, length(obs))
+      interaction <- interaction +
+        sweep(frame1 * frame2, 1L, term$singular[, j], "*")
+    }
+    eta <- eta + term$C * sweep(interaction, 1L, term$sd, "*")
+    if (!is.null(term$main1)) {
+      main1 <- term$main1[, J1, drop = FALSE]
+      main2 <- term$main2[, J2, drop = FALSE]
+      eta <- eta + term$Cmain1 * sweep(main1, 1L, term$sdmain1, "*") +
+        term$Cmain2 * sweep(main2, 1L, term$sdmain2, "*")
+    }
+  }
+  eta
 }
 
 # compute non-linear predictor terms

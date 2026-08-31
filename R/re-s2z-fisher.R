@@ -13,7 +13,7 @@
   # Fixed offsets are population-only known quantities, not latent
   # coordinates. Mirror has_special_terms() for every genuinely varying term
   # while deliberately leaving offsets out of this classification.
-  varying_terms <- c("sp", "sm", "gp", "ac", "cs")
+  varying_terms <- c("sp", "sm", "gp", "fm", "ac", "cs")
   NROW(x[["re"]]) > 0L || any(lengths(x[varying_terms]))
 }
 

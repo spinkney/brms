@@ -124,6 +124,14 @@ exclude_pars.bframel <- function(x, save_pars, ...) {
       nb <- seq_len(smframe$nbases[i])
       c(out) <- paste0("zs", p, "_", i, "_", nb)
     }
+    fmframe <- x$frame$fm
+    for (i in seq_rows(fmframe)) {
+      c(out) <- c(
+        paste0("zfm_frame", p, "_", i, "_1"),
+        paste0("zfm_frame", p, "_", i, "_2"),
+        paste0("zfm_spectrum", p, "_", i)
+      )
+    }
   }
   out
 }

@@ -1550,6 +1550,7 @@ test_that("noise-free terms appear in the Stan code", {
   expect_match2(scode, "lprior += normal_lpdf(bsp | 0, 5)")
   expect_match2(scode, "target += std_normal_lpdf(to_vector(zme_1))")
   expect_match2(scode, "lprior += normal_lpdf(meanme_1 | 0, 10)")
+  expect_match2(scode, "prior_meanme_1 = normal_rng(0,10)")
   expect_match2(scode, "lprior += cauchy_lpdf(sdme_1[2] | 0, 5)")
   expect_match2(scode, "lprior += lkj_corr_cholesky_lpdf(Lme_1 | 2)")
   expect_match2(scode, "+ transpose(diag_pre_multiply(sdme_1, Lme_1) * zme_1)")
