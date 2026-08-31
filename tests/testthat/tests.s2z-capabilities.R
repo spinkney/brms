@@ -354,6 +354,88 @@ test_that("exact logistic means cover every physical S2Z kernel shape", {
   )
 })
 
+test_that("exact logistic means compose with every S2Z centering chart", {
+  skip_if_not_installed("rstan")
+
+  population_prior <- prior(logistic(-1, 2), class = Intercept) +
+    prior(normal(0, 1), class = b, coef = x)
+  cases <- list(
+    noncentered = list(
+      formula = y ~ x +
+        (1 + x | gr(g, s2z = TRUE, center = FALSE)),
+      family = gaussian(), prior = population_prior
+    ),
+    partial = list(
+      formula = y ~ x +
+        (1 + x | gr(g, s2z = TRUE, center = 0.35)),
+      family = gaussian(), prior = population_prior
+    ),
+    fisher = list(
+      formula = y ~ x +
+        (1 + x | gr(g, s2z = TRUE, center = "fisher")),
+      family = gaussian(), prior = population_prior
+    ),
+    independent = list(
+      formula = y ~ x +
+        (1 + x || gr(g, s2z = TRUE, center = 0.35)),
+      family = gaussian(), prior = population_prior
+    ),
+    Student = list(
+      formula = y ~ x + (1 + x | gr(
+        g, s2z = TRUE, dist = "student", center = "fisher"
+      )),
+      family = gaussian(), prior = population_prior
+    ),
+    multiblock = list(
+      formula = y ~ x +
+        (1 + x | gr(g, id = "first", s2z = TRUE, center = 0.3)) +
+        (1 | gr(h, id = "second", s2z = TRUE, center = "fisher")),
+      family = gaussian(), prior = population_prior
+    )
+  )
+
+  code <- lapply(cases, s2z_cap_code)
+  for (name in names(code)) {
+    expect_s3_class(code[[name]], "brmsmodel")
+    expect_match2(code[[name]], "q_explicit_s2z_", info = name)
+    expect_match2(
+      code[[name]], "lprior += logistic_lpdf(q_explicit_s2z_", info = name
+    )
+  }
+  expect_match2(
+    code$noncentered, "r_s2z_1 = r_s2z_1 * L_Sigma_s2z_1';"
+  )
+  expect_false(grepl(
+    "log_det_partial_s2z_1", code$noncentered, fixed = TRUE
+  ))
+  expect_false(grepl(
+    "- (N_1 - 1) * sum(log(diagonal(L_Sigma_s2z_1)))",
+    code$noncentered, fixed = TRUE
+  ))
+  expect_match2(code$partial, "log_det_partial_s2z_1")
+  expect_match2(
+    code$partial,
+    "matrix<lower=0,upper=1>[N_1, M_1] rho_s2z_1;"
+  )
+  expect_match2(code$fisher, "rho_s2z_1[j, k]")
+  expect_match2(code$independent, "scale_partial_s2z")
+  expect_match2(code$Student, "group_scale_s2z_1 = dfm_1;")
+  expect_match2(code$Student, "rho_s2z_1[j, k]")
+  expect_match2(code$multiblock, "log_det_partial_s2z_1")
+  expect_match2(code$multiblock, "rho_s2z_2[j, 1]")
+
+  default_code <- stancode(
+    y ~ x + (1 + x | gr(g, s2z = TRUE)),
+    data = s2z_cap_dat, prior = population_prior
+  )
+  centered_code <- stancode(
+    y ~ x + (1 + x | gr(g, s2z = TRUE, center = TRUE)),
+    data = s2z_cap_dat, prior = population_prior
+  )
+  expect_identical(default_code, centered_code)
+})
+
+
 test_that("fixed-only coordinates keep arbitrary ordinary brms priors", {
   skip_if_not_installed("rstan")
 
@@ -486,14 +568,14 @@ test_that("additional S2Z gates reject in the intended phase with context", {
   expect_match(msg, "drop_unused_levels = TRUE", fixed = TRUE)
 })
 
-test_that("foundation code contains no later S2Z APIs or state", {
+test_that("Plan 03 surface excludes later S2Z APIs and state", {
   public_arguments <- names(formals(gr))
-  expect_false("center" %in% public_arguments)
+  expect_true("center" %in% public_arguments)
   expect_false("scale" %in% public_arguments)
-  expect_error(
-    gr(g, s2z = TRUE, center = "auto"),
-    "expects only a single grouping term"
-  )
+  expect_false("latent" %in% public_arguments)
+  fisher_term <- gr(g, s2z = TRUE, center = "fisher")
+  expect_true(isTRUE(fisher_term$s2z_center_auto))
+  expect_equal(fisher_term$s2z_center, 0.5)
   expect_error(
     gr(g, s2z = TRUE, scale = "varying"),
     "expects only a single grouping term"
@@ -503,10 +585,7 @@ test_that("foundation code contains no later S2Z APIs or state", {
     y ~ x + (1 + x | gr(g, s2z = TRUE)),
     data = s2z_cap_dat, parse = FALSE
   )
-  forbidden <- c(
-    "s2z_center", "s2z_center_auto", "rho_s2z", "mean_rho_s2z",
-    "sdlog_s2z", "sd_level", "z_sd_s2z"
-  )
+  forbidden <- c("sdlog_s2z", "sd_level", "z_sd_s2z")
   for (term in forbidden) {
     expect_false(grepl(term, code, fixed = TRUE), info = term)
   }
@@ -535,17 +614,16 @@ test_that("foundation code contains no later S2Z APIs or state", {
   ))
   audit_text <- unlist(lapply(audit_files, readLines, warn = FALSE))
   forbidden_patterns <- c(
-    paste0("s2z", "_center"),
-    paste0("s2z", "_center_auto"),
-    paste0("rho", "_s2z"),
-    paste0("mean_rho", "_s2z"),
     paste0("sdlog", "_s2z"),
     paste0("sd", "_level"),
     paste0("z_sd", "_s2z"),
     paste0("relative_sd", "_s2z"),
     paste0("reference_sd", "_s2z"),
-    "center[[:space:]]*=[[:space:]]*['\"](auto|fisher)['\"]",
-    "scale[[:space:]]*=[[:space:]]*['\"]varying['\"]"
+    paste0("s2z", "_cross"),
+    paste0("s2z", "_latent"),
+    paste0("modal", "_s2z"),
+    "scale[[:space:]]*=[[:space:]]*['\"]varying['\"]",
+    "latent[[:space:]]*=[[:space:]]*TRUE"
   )
   for (pattern in forbidden_patterns) {
     expect_false(any(grepl(pattern, audit_text)), info = pattern)

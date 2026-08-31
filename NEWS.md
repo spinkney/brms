@@ -2,6 +2,22 @@
 
 ### New Features
 
+* Add exact centered, non-centered, partially centered, and automatic
+parameterizations for ordinary Gaussian and Student-t group effects via
+`gr(..., center = ...)`. The historical default (`NULL`, `FALSE`, or `0`)
+remains non-centered; `TRUE` or `1` selects centered coordinates; and a
+number in `[0, 1]` selects an exact partial chart. Student-t effects use the
+same affine map conditional on their existing scale-mixture variable.
+`center = "fisher"` (with `"auto"` as an alias) chooses response-free,
+level- and coefficient-specific fractions from the current group covariance
+and likelihood information computed in Stan. Fixed centering fractions are
+supported in eligible predictor-local ordinary blocks, including ordinal,
+distributional, nonlinear, categorical, and multivariate models. Fisher
+centering excludes ordinal and nonlinear predictors; predictor-local
+multivariate Fisher blocks require `set_rescor(FALSE)`. Positive ordinary
+centering excludes cross-predictor IDs, `by`, `cov`, `pw`, multi-membership,
+and special group coefficients.
+
 * Add an experimental physical sum-to-zero parameterization via
 `gr(..., s2z = TRUE)` for ordinary matched varying intercepts, numeric and
 factor slopes, and interactions. The likelihood uses group deviations that
@@ -34,9 +50,14 @@ supported through conditionally Gaussian machinery.
 Ordinal `threshold = "sum_to_zero"`, fixed or shared ordinal-mixture
 thresholds, category-specific S2Z group effects, and the non-Gaussian
 active-prior fallback (including logistic priors) remain unsupported. The S2Z
-implementation still has no public centering or scaling-mode API; centered,
-partially centered, or automatically centered modes and group scales varying
-by level remain deferred. Structural extensions such as `by`, `cov`, `pw`,
+implementation supports `center = FALSE` for exact non-centered coordinates,
+numeric values in `[0, 1]` for exact partial centering, and
+`center = "fisher"` (or `"auto"`) for response-free automatic centering;
+omitting `center` retains the centered physical S2Z chart. Exact logistic
+active-coordinate priors compose with every supported S2Z centering chart.
+Fixed centering is supported for ordinal S2Z location predictors, while
+ordinal Fisher centering remains unavailable. Group scales varying by level
+remain deferred. Structural extensions such as `by`, `cov`, `pw`,
 multi-membership, other special group coefficients, cross-predictor IDs, and
 sparse or QR designs also remain unsupported.
 (#1916)

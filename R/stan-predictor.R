@@ -649,6 +649,20 @@ stan_re <- function(bframe, prior, normalize, ...) {
   px <- check_prefix(r)
   uresp <- usc(unique(px$resp))
   idp <- paste0(r$id, usc(combine_prefix(px)))
+  center_mode <- re_s2z_center_mode(r)
+  center_fisher <- identical(center_mode, "auto")
+  s2z_ordinal <- isTRUE(r$s2z[1]) && !is.null(joint_s2z) &&
+    isTRUE(joint_s2z$infos[[1L]]$ordinal)
+  if (s2z_ordinal && center_fisher) {
+    stop2("Fisher centering is not yet supported for ordinal S2Z effects.")
+  }
+  fisher_info <- NULL
+  if (center_fisher) {
+    fisher_info <- stan_re_s2z_fisher_info(
+      id, r = r, bframe = bframe, threads = threads
+    )
+    str_add(out$fun) <- fisher_info$fun %||% ""
+  }
   # define data needed for group-level effects
   str_add(out$data) <- glue(
     "  // data for group-level effects of ID {id}\n",
@@ -755,14 +769,22 @@ stan_re <- function(bframe, prior, normalize, ...) {
   if (isTRUE(r$s2z[1]) && !is.null(joint_s2z)) {
     return(.stan_re_s2z_joint_block(
       id, set = joint_s2z, bframe = bframe, prior = prior,
-      threads = threads, normalize = normalize, out = out
+      threads = threads, normalize = normalize, out = out,
+      fisher_info = fisher_info
     ))
   }
 
   if (isTRUE(r$s2z[1])) {
     return(.stan_re_s2z(
       id, bframe = bframe, prior = prior, threads = threads,
-      normalize = normalize, out = out
+      normalize = normalize, out = out, fisher_info = fisher_info
+    ))
+  }
+
+  if (!identical(center_mode, "noncentered")) {
+    return(.stan_re_centered(
+      id, r = r, bframe = bframe, prior = prior,
+      normalize = normalize, out = out, fisher_info = fisher_info
     ))
   }
 
@@ -919,6 +941,2109 @@ stan_re <- function(bframe, prior, normalize, ...) {
   out
 }
 
+# Exact unrestricted centering chart for ordinary group effects. For one
+# grouping level with conditional Cholesky factor L and centering fractions
+# rho, define A = diag(rho) L + diag(1 - rho) and map the sampled coordinate q
+# to the conventional effect r = L A^-1 q. The Jacobian is |L| / |A|. Unlike
+# the S2Z chart, this full-space map needs neither a zero-sum projection nor a
+# restricted-determinant correction. Student-t effects use their existing
+# conditional scale-mixture factor in L, which preserves the legacy chart at
+# rho = 0 exactly.
+.stan_re_centered <- function(id, r, bframe, prior, normalize,
+                              out = list(), fisher_info = NULL) {
+  stopifnot(is.reframe(r), has_rows(r), !any(r$s2z))
+  lpdf <- stan_lpdf_name(normalize)
+  mode <- re_s2z_center_mode(r)
+  stopifnot(mode %in% c("centered", "partial", "auto"))
+  is_cor <- nrow(r) > 1L && isTRUE(r$cor[1L])
+  is_student <- identical(r$dist[1L], "student")
+  has_by <- nzchar(r$by[1L])
+  has_cov <- nzchar(r$cov[1L])
+  has_pw <- isTRUE(nzchar(r$gcall[[1L]]$pw))
+  stopifnot(!has_by, !has_cov, !has_pw)
+  M <- nrow(r)
+  J <- seq_rows(r)
+  px <- check_prefix(r)
+  idp <- paste0(r$id, usc(combine_prefix(px)))
+  rho <- re_s2z_center_values(r)
+  tr <- subset_reframe_dist(r, "student")
+  g <- if (is_student) usc(tr$ggn[1L]) else ""
+
+  if (!is.null(fisher_info)) {
+    stopifnot(identical(mode, "auto"))
+    out <- stan_re_s2z_fisher_def(out, id)
+    if (isTRUE(fisher_info$fixed_design)) {
+      out <- stan_re_s2z_fisher_tdata(out, id, r, fisher_info)
+    }
+  }
+
+  # Keep the established internal z_ID names so default save/exclude behavior
+  # and downstream public r_ID naming remain unchanged.
+  chart_comment <- if (identical(mode, "centered")) {
+    "centered group-level coordinates"
+  } else if (identical(mode, "auto")) {
+    "Fisher-centered group-level coordinates"
+  } else {
+    "partially centered group-level coordinates"
+  }
+
+  if (is_cor) {
+    str_add(out$data) <- glue(
+      "  int<lower=1> NC_{id};  // number of group-level correlations\n"
+    )
+    str_add_list(out) <- stan_prior(
+      prior, class = "L", group = r$group[1L], suffix = usc(id),
+      type = glue("cholesky_factor_corr[M_{id}]"),
+      comment = "cholesky factor of correlation matrix",
+      normalize = normalize
+    )
+    str_add(out$par) <- glue(
+      "  matrix[M_{id}, N_{id}] z_{id};  // {chart_comment}\n"
+    )
+    str_add(out$tpar_def) <- glue(
+      "  matrix[M_{id}, M_{id}] L_center_re_{id};",
+      "  // Gaussian-reference group Cholesky factor\n",
+      "  matrix[N_{id}, M_{id}] r_{id};",
+      "  // actual group-level effects\n",
+      "  real log_jacobian_re_{id};",
+      "  // unrestricted centering log-Jacobian\n"
+    )
+    str_add(out$tpar_comp) <- glue(
+      "  L_center_re_{id} = diag_pre_multiply(sd_{id}, L_{id});\n"
+    )
+    if (!is.null(fisher_info)) {
+      str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+        id, r = r, fisher_info = fisher_info,
+        L = glue("L_center_re_{id}")
+      )
+    }
+    if (identical(mode, "centered")) {
+      str_add(out$tpar_comp) <- glue(
+        "  r_{id} = z_{id}';\n",
+        "  log_jacobian_re_{id} = 0.0;\n"
+      )
+    } else {
+      rho_def <- if (identical(mode, "auto")) {
+        ""
+      } else {
+        rho_code <- stan_vector(vapply(rho, stan_s2z_number, character(1)))
+        glue("    vector[M_{id}] rho_center_re = {rho_code};\n")
+      }
+      rho_j <- if (identical(mode, "auto")) {
+        "rho_level_center_re"
+      } else {
+        "rho_center_re"
+      }
+      rho_level_def <- if (identical(mode, "auto")) {
+        glue(
+          "      vector[M_{id}] rho_level_center_re = ",
+          "rho_s2z_{id}[j]';\n"
+        )
+      } else {
+        ""
+      }
+      str_add(out$tpar_comp) <- glue(
+        "  {{\n",
+        "{rho_def}",
+        "    log_jacobian_re_{id} = 0.0;\n",
+        "    for (j in 1:N_{id}) {{\n",
+        "      matrix[M_{id}, M_{id}] L_group_center_re = ",
+        "L_center_re_{id};\n",
+        "{rho_level_def}",
+        str_if(
+          is_student,
+          glue("      L_group_center_re *= dfm{g}[j];\n")
+        ),
+        "      matrix[M_{id}, M_{id}] L_partial_center_re = ",
+        "diag_pre_multiply({rho_j}, L_group_center_re);\n",
+        "      vector[M_{id}] white_center_re;\n",
+        "      for (k in 1:M_{id}) {{\n",
+        "        L_partial_center_re[k, k] += 1.0 - {rho_j}[k];\n",
+        "      }}\n",
+        "      white_center_re = mdivide_left_tri_low(",
+        "L_partial_center_re, z_{id}[, j]);\n",
+        "      r_{id}[j] = (L_group_center_re * white_center_re)';\n",
+        "      log_jacobian_re_{id} += ",
+        "sum(log(diagonal(L_group_center_re))) - ",
+        "sum(log(diagonal(L_partial_center_re)));\n",
+        "    }}\n",
+        "  }}\n"
+      )
+    }
+    str_add(out$model_prior) <- glue(
+      "  for (j in 1:N_{id}) {{\n",
+      "    matrix[M_{id}, M_{id}] L_group_center_re = ",
+      "L_center_re_{id};\n",
+      str_if(
+        is_student,
+        glue("    L_group_center_re *= dfm{g}[j];\n")
+      ),
+      "    target += multi_normal_cholesky_{lpdf}(r_{id}[j]' | ",
+      "zeros_vector(M_{id}), L_group_center_re);\n",
+      "  }}\n",
+      "  target += log_jacobian_re_{id};\n"
+    )
+    str_add(out$gen_def) <- glue(
+      "  // compute group-level correlations\n",
+      "  corr_matrix[M_{id}] Cor_{id}",
+      " = multiply_lower_tri_self_transpose(L_{id});\n",
+      "  vector<lower=-1,upper=1>[NC_{id}] cor_{id};\n"
+    )
+    str_add(out$gen_comp) <- stan_cor_gen_comp(
+      cor = glue("cor_{id}"), ncol = glue("M_{id}")
+    )
+    str_add(out$tpar_def) <-
+      "  // using vectors speeds up indexing in loops\n"
+    str_add(out$tpar_def) <- cglue(
+      "  vector[N_{id}] r_{idp}_{r$cn};\n"
+    )
+    str_add(out$tpar_comp) <- cglue(
+      "  r_{idp}_{r$cn} = r_{id}[, {J}];\n"
+    )
+  } else {
+    str_add(out$par) <- glue(
+      "  array[M_{id}] vector[N_{id}] z_{id};",
+      "  // {chart_comment}\n"
+    )
+    str_add(out$tpar_def) <- glue(
+      "  real log_jacobian_re_{id};",
+      "  // unrestricted centering log-Jacobian\n"
+    )
+    str_add(out$tpar_def) <- cglue(
+      "  vector[N_{id}] r_{idp}_{r$cn};",
+      "  // actual group-level effects\n"
+    )
+    if (!is.null(fisher_info)) {
+      str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+        id, r = r, fisher_info = fisher_info,
+        scale = if (M == 1L) glue("sd_{id}[1]") else NULL,
+        diag_scale = if (M > 1L) glue("sd_{id}") else NULL
+      )
+    }
+    if (identical(mode, "centered")) {
+      str_add(out$tpar_comp) <- cglue(
+        "  r_{idp}_{r$cn} = z_{id}[{J}];\n"
+      )
+      str_add(out$tpar_comp) <- glue(
+        "  log_jacobian_re_{id} = 0.0;\n"
+      )
+    } else {
+      str_add(out$tpar_comp) <- glue(
+        "  log_jacobian_re_{id} = 0.0;\n"
+      )
+      for (k in seq_len(M)) {
+        rho_k <- if (identical(mode, "auto")) {
+          glue("rho_s2z_{id}[, {k}]")
+        } else {
+          stan_s2z_number(rho[k])
+        }
+        scale_k <- if (is_student) {
+          glue("sd_{id}[{k}] * dfm{g}")
+        } else {
+          glue("rep_vector(sd_{id}[{k}], N_{id})")
+        }
+        str_add(out$tpar_comp) <- glue(
+          "  {{\n",
+          "    vector[N_{id}] scale_group_center_re = {scale_k};\n",
+          "    vector[N_{id}] denominator_center_re = 1.0 - ({rho_k}) + ",
+          "({rho_k}) .* scale_group_center_re;\n",
+          "    r_{idp[k]}_{r$cn[k]} = scale_group_center_re .* ",
+          "z_{id}[{k}] ./ denominator_center_re;\n",
+          "    log_jacobian_re_{id} += sum(log(scale_group_center_re)) - ",
+          "sum(log(denominator_center_re));\n",
+          "  }}\n"
+        )
+      }
+    }
+    for (k in seq_len(M)) {
+      scale_k <- if (is_student) {
+        glue("sd_{id}[{k}] * dfm{g}")
+      } else {
+        glue("sd_{id}[{k}]")
+      }
+      str_add(out$model_prior) <- glue(
+        "  target += normal_{lpdf}(r_{idp[k]}_{r$cn[k]} | 0, ",
+        "{scale_k});\n"
+      )
+    }
+    str_add(out$model_prior) <- glue(
+      "  target += log_jacobian_re_{id};\n"
+    )
+  }
+  str_add(out$pll_args) <- cglue(
+    ", vector r_{idp}_{r$cn}"
+  )
+  out
+}
+
+# The response-free Fisher-information catalog and chart core are kept
+# together so both ordinary and S2Z group effects use the same reference.
+# Construct a link-scale reference predictor that is independent of every S2Z
+# contrast in its linear predictor. Fisher fractions may depend on this global
+# finite-population coordinate without changing the restricted Jacobian: with
+# the S2Z coordinates held last, the full coordinate map remains block
+# triangular. Keeping this first implementation to dense population terms and
+# fixed offsets also makes that independence auditable in generated Stan code.
+stan_re_s2z_fisher_reference_eta <- function(bfl, n = "n") {
+  stopifnot(is.bframel(bfl))
+  unsupported <- function(detail) {
+    stop2("Fisher centering for group-level effects ", detail, ".")
+  }
+  special <- c("cs", "sm", "sp", "gp")
+  if (any(vapply(special, function(x) has_rows(bfl$frame[[x]]), logical(1)))) {
+    unsupported(paste0(
+      "currently requires a population-only reference predictor without ",
+      "category-specific, smooth, spatial, or Gaussian-process terms"
+    ))
+  }
+  fe <- bfl$frame$fe
+  if (isTRUE(fe$sparse) || !identical(fe$decomp, "none")) {
+    unsupported("currently requires a dense, non-QR population design")
+  }
+  p <- usc(combine_prefix(check_prefix(bfl)))
+  K <- length(fe$vars_stan)
+  s2z <- has_re_s2z(bfl)
+  eta <- if (isTRUE(fe$center)) {
+    intercept <- if (s2z) glue("theta_s2z{p}[1]") else glue("Intercept{p}")
+    if (K) {
+      coefficient <- if (s2z) {
+        glue("tail(theta_s2z{p}, {K})")
+      } else {
+        glue("b{p}")
+      }
+      glue("{intercept} + dot_product(Xc{p}[{n}], {coefficient})")
+    } else {
+      intercept
+    }
+  } else {
+    if (K) {
+      coefficient <- if (s2z) glue("theta_s2z{p}") else glue("b{p}")
+      glue("dot_product(X{p}[{n}], {coefficient})")
+    } else {
+      "0.0"
+    }
+  }
+  if (is.formula(bfl$offset)) {
+    eta <- glue("({eta}) + offsets{p}[{n}]")
+  }
+  eta
+}
+
+# Natural-scale reference and derivative for one distributional parameter.
+# Every reference deliberately excludes group-level contrasts. Consequently
+# an automatic chart may depend on population and nuisance parameters without
+# making the restricted S2Z Jacobian depend on the coordinates it transforms.
+stan_re_s2z_fisher_dpar_reference <- function(
+    bframe, dpar, n = "n", eta = NULL
+) {
+  stopifnot(is.brmsframe(bframe), length(dpar) == 1L)
+  bfl <- bframe$dpars[[dpar]]
+  if (!is.null(eta)) {
+    eta <- as_one_character(eta)
+    if (!is.bframel(bfl) && !is.bframenl(bfl)) {
+      stop2("A Fisher reference override requires a predicted ",
+            "distributional parameter '", dpar, "'.")
+    }
+  } else if (is.bframenl(bfl)) {
+    stop2("Fisher centering requires an explicit score-free reference for ",
+          "nonlinear distributional parameter '", dpar, "'.")
+  } else if (!is.bframel(bfl)) {
+    # Unpredicted auxiliary parameters are scalar Stan parameters (or fixed
+    # scalar transformed parameters) already on their natural scale.
+    value <- paste0(dpar, usc(bframe$resp))
+    return(nlist(
+      dpar, bfl = NULL, eta = value, link = "identity", value,
+      derivative = "1.0"
+    ))
+  } else {
+    eta <- stan_re_s2z_fisher_reference_eta(bfl, n = n)
+  }
+  link <- bfl$family$link
+  inv_link <- stan_inv_link(link, transform = TRUE)
+  value <- if (nzchar(inv_link)) glue("{inv_link}({eta})") else glue("({eta})")
+  derivative <- switch(
+    link,
+    identity = "1.0",
+    log = value,
+    logm1 = glue("exp({eta})"),
+    log1p = glue("exp({eta})"),
+    inverse = glue("-inv_square({eta})"),
+    sqrt = glue("2.0 * ({eta})"),
+    "1/mu^2" = glue("-0.5 * inv({eta}) * inv_sqrt({eta})"),
+    logit = glue("{value} * (1.0 - {value})"),
+    probit = glue("exp(std_normal_lpdf({eta}))"),
+    probit_approx = glue(
+      "{value} * (1.0 - {value}) * ",
+      "(1.5976 + 0.21168 * square({eta}))"
+    ),
+    cloglog = glue("exp(({eta}) - exp({eta}))"),
+    cauchit = glue("inv(pi() * (1.0 + square({eta})))"),
+    softplus = glue("inv_logit({eta})"),
+    squareplus = glue(
+      "0.5 * (1.0 + ({eta}) / sqrt(square({eta}) + 4.0))"
+    ),
+    softit = glue(
+      "inv_logit({eta}) / square(1.0 + log1p_exp({eta}))"
+    ),
+    tan_half = glue("2.0 / (1.0 + square({eta}))"),
+    stop2("Fisher centering does not yet implement the derivative of link '",
+          link, "'.")
+  )
+  nlist(dpar, bfl, eta, link, value, derivative)
+}
+
+# Response-free conditional expected information for a scalar distributional
+# predictor. Exact identities are preferred; a small number of families use a
+# positive analytic coarsening or moment approximation when their exact
+# expectation would require a sum or integral. The result is already on the
+# predictor (eta) scale and is safe to evaluate inside Stan autodiff.
+stan_re_s2z_fisher_closed_form <- function(
+    bframe, dpar, n = "n", reference_eta = NULL
+) {
+  stopifnot(is.brmsframe(bframe), length(dpar) == 1L)
+  if (is.null(reference_eta)) {
+    reference_eta <- list()
+  }
+  if (is.character(reference_eta)) {
+    reference_eta <- as.list(reference_eta)
+  }
+  if (!is.list(reference_eta) ||
+      length(reference_eta) && is.null(names(reference_eta)) ||
+      any(!nzchar(names(reference_eta)))) {
+    stop2("Argument 'reference_eta' must be a named list or character vector.")
+  }
+  family <- bframe$family$family
+  references <- new.env(parent = emptyenv())
+  definitions <- character()
+  ref <- function(dp) {
+    if (exists(dp, envir = references, inherits = FALSE)) {
+      return(get(dp, envir = references, inherits = FALSE))
+    }
+    raw <- stan_re_s2z_fisher_dpar_reference(
+      bframe, dp, n = n, eta = reference_eta[[dp]]
+    )
+    key <- make_stan_names(dp)
+    eta_name <- paste0("eta_fisher_s2z_", key)
+    value_name <- paste0("value_fisher_s2z_", key)
+    derivative_name <- paste0("derivative_fisher_s2z_", key)
+    value_expression <- gsub(
+      raw$eta, eta_name, raw$value, fixed = TRUE
+    )
+    derivative_expression <- gsub(
+      raw$value, value_name, raw$derivative, fixed = TRUE
+    )
+    derivative_expression <- gsub(
+      raw$eta, eta_name, derivative_expression, fixed = TRUE
+    )
+    definitions <<- c(definitions, glue(
+      "        real {eta_name} = {raw$eta};\n",
+      "        real {value_name} = {value_expression};\n",
+      "        real {derivative_name} = {derivative_expression};\n"
+    ))
+    out <- raw
+    out$eta <- eta_name
+    out$value <- value_name
+    out$derivative <- derivative_name
+    assign(dp, out, envir = references)
+    out
+  }
+  target <- ref(dpar)
+  sq_chain <- glue("square({target$derivative})")
+  resp <- usc(bframe$resp)
+  rate <- is.formula(bframe$adforms$rate)
+  denom <- if (rate) glue("denom{resp}[{n}]") else "1.0"
+  scaled <- function(x) if (rate) glue("({x}) * {denom}") else x
+  scaled_derivative <- function(x) {
+    if (rate) glue("({x}) * {denom}") else x
+  }
+  # Stable Bernoulli information on the predictor scale. In particular, avoid
+  # the 0 / 0 form produced when an inverse-logit rounds to exactly zero or one
+  # in a far-tail proposal.
+  binary_information <- function(x) {
+    if (identical(x$link, "logit")) {
+      return(glue("({x$value}) * (1.0 - ({x$value}))"))
+    }
+    if (identical(x$link, "probit")) {
+      return(glue(
+        "exp(2.0 * std_normal_lpdf({x$eta}) - ",
+        "std_normal_lcdf({x$eta}) - std_normal_lccdf({x$eta}))"
+      ))
+    }
+    if (identical(x$link, "probit_approx")) {
+      return(glue(
+        "({x$value}) * (1.0 - ({x$value})) * square(",
+        "1.5976 + 0.21168 * square({x$eta}))"
+      ))
+    }
+    glue(
+      "square({x$derivative}) / fmax(({x$value}) * ",
+      "(1.0 - ({x$value})), 1e-12)"
+    )
+  }
+  quantile_information <- function(x) {
+    if (identical(x$link, "logit")) {
+      return(glue(
+        "square({x$value}) + square(1.0 - ({x$value}))"
+      ))
+    }
+    glue(
+      "square({x$derivative}) * (square({x$value}) + ",
+      "square(1.0 - ({x$value}))) / fmax(square({x$value}) * ",
+      "square(1.0 - ({x$value})), 1e-24)"
+    )
+  }
+  # x^2 trigamma(x) tends to one as x tends to zero. This scaled form avoids
+  # the indeterminate products arising in beta and Dirichlet information when
+  # a probability predictor saturates numerically.
+  scaled_trigamma <- function(x) {
+    glue("(({x}) < 1e-6 ? 1.0 : square({x}) * trigamma({x}))")
+  }
+
+  value <- target$value
+  derivative <- target$derivative
+  out <- NULL
+  if (family == "gaussian") {
+    sigma <- ref("sigma")$value
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * inv_square({sigma})"),
+      sigma = glue("2.0 * {sq_chain} * inv_square({value})"),
+      NULL
+    )
+  } else if (family == "student") {
+    sigma <- ref("sigma")$value
+    nu <- ref("nu")$value
+    out <- switch(dpar,
+      mu = glue(
+        "{sq_chain} * ({nu} + 1.0) / ({nu} + 3.0) * ",
+        "inv_square({sigma})"
+      ),
+      sigma = glue(
+        "{sq_chain} * 2.0 * {nu} / ({nu} + 3.0) * ",
+        "inv_square({value})"
+      ),
+      nu = glue(
+        "{sq_chain} * ({nu} > 1e4 ? 3.5 / pow({nu}, 4) : ",
+        "fmax(0.0, 0.25 * (trigamma(0.5 * {nu}) - ",
+        "trigamma(0.5 * ({nu} + 1.0))) - ({nu} + 5.0) / ",
+        "(2.0 * {nu} * ({nu} + 1.0) * ({nu} + 3.0))))"
+      ),
+      NULL
+    )
+  } else if (family == "skew_normal") {
+    sigma <- ref("sigma")$value
+    alpha <- ref("alpha")$value
+    if (dpar == "alpha") {
+      definitions <- c(definitions, glue(
+        "        real delta_fisher_s2z_skew = ({alpha}) / ",
+        "sqrt(1.0 + square({alpha}));\n",
+        "        real b_fisher_s2z_skew = sqrt(2.0 / pi()) * ",
+        "delta_fisher_s2z_skew;\n",
+        "        real variance_factor_fisher_s2z_skew = 1.0 - ",
+        "square(b_fisher_s2z_skew);\n",
+        "        real db_fisher_s2z_skew = sqrt(2.0 / pi()) * ",
+        "pow(1.0 + square({alpha}), -1.5);\n",
+        "        real dskewness_fisher_s2z_skew = 1.5 * ",
+        "(4.0 - pi()) * square(b_fisher_s2z_skew) * ",
+        "db_fisher_s2z_skew * ",
+        "pow(variance_factor_fisher_s2z_skew, -2.5);\n",
+        "        real dkurtosis_fisher_s2z_skew = 8.0 * ",
+        "(pi() - 3.0) * pow(b_fisher_s2z_skew, 3) * ",
+        "db_fisher_s2z_skew * ",
+        "pow(variance_factor_fisher_s2z_skew, -3.0);\n"
+      ))
+    }
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * inv_square({sigma})"),
+      sigma = glue("2.0 * {sq_chain} * inv_square({value})"),
+      alpha = glue(
+        "{sq_chain} * (square(dskewness_fisher_s2z_skew) / 6.0 + ",
+        "square(dkurtosis_fisher_s2z_skew) / 24.0)"
+      ),
+      NULL
+    )
+  } else if (family == "logistic_normal") {
+    all_dpars <- valid_dpars(bframe)
+    mu_dpars <- all_dpars[vapply(
+      all_dpars,
+      function(dp) identical(dpar_class(dp, bframe$family), "mu"),
+      logical(1)
+    )]
+    sigma_dpars <- all_dpars[vapply(
+      all_dpars,
+      function(dp) identical(dpar_class(dp, bframe$family), "sigma"),
+      logical(1)
+    )]
+    Klogit <- length(mu_dpars)
+    if (Klogit && length(sigma_dpars) == Klogit) {
+      definitions <- c(definitions, glue(
+        "        matrix[{Klogit}, {Klogit}] corr_precision_fisher_s2z_ln = ",
+        "chol2inv(Llncor{resp});\n"
+      ))
+      if (dpar %in% mu_dpars) {
+        k <- match(dpar, mu_dpars)
+        sigma_k <- ref(sigma_dpars[k])$value
+        out <- glue(
+          "corr_precision_fisher_s2z_ln[{k}, {k}] * ",
+          "inv_square({sigma_k})"
+        )
+      } else if (dpar %in% sigma_dpars) {
+        k <- match(dpar, sigma_dpars)
+        out <- glue(
+          "square(({derivative}) / ({value})) * ",
+          "(1.0 + corr_precision_fisher_s2z_ln[{k}, {k}])"
+        )
+      }
+    }
+  } else if (family %in% c("lognormal", "shifted_lognormal")) {
+    sigma <- ref("sigma")$value
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * inv_square({sigma})"),
+      sigma = glue("2.0 * {sq_chain} * inv_square({value})"),
+      ndt = str_if(
+        family == "shifted_lognormal",
+        glue(
+          "{sq_chain} * exp(-2.0 * {ref('mu')$value} + ",
+          "2.0 * square({sigma})) * (1.0 + inv_square({sigma}))"
+        )
+      ),
+      NULL
+    )
+  } else if (family %in% c("bernoulli", "binomial")) {
+    if (dpar == "mu") {
+      trials <- if (family == "binomial") {
+        glue("trials{resp}[{n}]")
+      } else {
+        "1.0"
+      }
+      out <- glue("{trials} * ({binary_information(target)})")
+    }
+  } else if (family %in% c("categorical", "multinomial")) {
+    mu_dpars <- names(bframe$dpars)[vapply(
+      names(bframe$dpars),
+      function(dp) identical(dpar_class(dp, bframe$family), "mu"),
+      logical(1)
+    )]
+    refcat <- get_refcat(bframe$family, int = TRUE)
+    if (isNA(refcat)) {
+      Kcat <- length(mu_dpars)
+      positions <- seq_len(Kcat)
+    } else {
+      Kcat <- length(mu_dpars) + 1L
+      positions <- setdiff(seq_len(Kcat), refcat)
+    }
+    target_position <- positions[match(dpar, mu_dpars)]
+    if (!is.na(target_position)) {
+      raw_eta <- vapply(mu_dpars, function(dp) {
+        ref(dp)$eta
+      }, character(1))
+      assignments <- paste0(vapply(seq_along(mu_dpars), function(k) {
+        glue(
+          "        eta_fisher_s2z_cat[{positions[k]}] = {raw_eta[k]};\n"
+        )
+      }, character(1)), collapse = "")
+      definitions <- c(definitions, glue(
+        "        vector[{Kcat}] eta_fisher_s2z_cat = zeros_vector({Kcat});\n",
+        "{assignments}",
+        "        vector[{Kcat}] prob_fisher_s2z_cat = ",
+        "softmax(eta_fisher_s2z_cat);\n"
+      ))
+      trials <- if (family == "multinomial") {
+        glue("trials{resp}[{n}]")
+      } else {
+        "1.0"
+      }
+      out <- glue(
+        "{trials} * prob_fisher_s2z_cat[{target_position}] * ",
+        "(1.0 - prob_fisher_s2z_cat[{target_position}])"
+      )
+    }
+  } else if (family %in% c("dirichlet", "dirichlet_multinomial")) {
+    mu_dpars <- names(bframe$dpars)[vapply(
+      names(bframe$dpars),
+      function(dp) identical(dpar_class(dp, bframe$family), "mu"),
+      logical(1)
+    )]
+    phi <- ref("phi")$value
+    refcat <- get_refcat(bframe$family, int = TRUE)
+    if (isNA(refcat)) {
+      Kcat <- length(mu_dpars)
+      positions <- seq_len(Kcat)
+    } else {
+      Kcat <- length(mu_dpars) + 1L
+      positions <- setdiff(seq_len(Kcat), refcat)
+    }
+    raw_eta <- vapply(mu_dpars, function(dp) {
+      ref(dp)$eta
+    }, character(1))
+    assignments <- paste0(vapply(seq_along(mu_dpars), function(k) {
+      glue(
+        "        eta_fisher_s2z_dir[{positions[k]}] = {raw_eta[k]};\n"
+      )
+    }, character(1)), collapse = "")
+    definitions <- c(definitions, glue(
+      "        vector[{Kcat}] eta_fisher_s2z_dir = zeros_vector({Kcat});\n",
+      "{assignments}",
+      "        vector[{Kcat}] prob_fisher_s2z_dir = ",
+      "softmax(eta_fisher_s2z_dir);\n"
+    ))
+    target_position <- positions[match(dpar, mu_dpars)]
+    if (!is.na(target_position) && family == "dirichlet") {
+      definitions <- c(definitions, glue(
+        "        real info_fisher_s2z_dir = 0.0;\n",
+        "        for (c in 1:{Kcat}) {{\n",
+        "          real alpha_fisher_s2z_dir = ({phi}) * ",
+        "prob_fisher_s2z_dir[c];\n",
+        "          real score_factor_fisher_s2z_dir = ",
+        "(c == {target_position}) - ",
+        "prob_fisher_s2z_dir[{target_position}];\n",
+        "          info_fisher_s2z_dir += square(",
+        "score_factor_fisher_s2z_dir) * ",
+        "(alpha_fisher_s2z_dir < 1e-6 ? 1.0 : ",
+        "square(alpha_fisher_s2z_dir) * ",
+        "trigamma(alpha_fisher_s2z_dir));\n",
+        "        }}\n"
+      ))
+      out <- "info_fisher_s2z_dir"
+    } else if (dpar == "phi" && family == "dirichlet") {
+      definitions <- c(definitions, glue(
+        "        real info_fisher_s2z_dir = -trigamma({phi});\n",
+        "        for (c in 1:{Kcat}) {{\n",
+        "          real alpha_fisher_s2z_dir = ({phi}) * ",
+        "prob_fisher_s2z_dir[c];\n",
+        "          info_fisher_s2z_dir += ",
+        "(alpha_fisher_s2z_dir < 1e-6 ? 1.0 : ",
+        "square(alpha_fisher_s2z_dir) * ",
+        "trigamma(alpha_fisher_s2z_dir)) * inv_square({phi});\n",
+        "        }}\n"
+      ))
+      out <- glue("{sq_chain} * fmax(0.0, info_fisher_s2z_dir)")
+    } else if (family == "dirichlet_multinomial") {
+      trials <- glue("trials{resp}[{n}]")
+      effective_trials <- glue(
+        "(({trials}) * (1.0 + ({phi})) / (({trials}) + ({phi})))"
+      )
+      if (!is.na(target_position)) {
+        out <- glue(
+          "{effective_trials} * prob_fisher_s2z_dir[{target_position}] * ",
+          "(1.0 - prob_fisher_s2z_dir[{target_position}])"
+        )
+      } else if (dpar == "phi") {
+        out <- glue(
+          "({trials} == 0 ? 0.0 : 0.5 * ({Kcat} - 1.0) * ",
+          "{sq_chain} * square(inv(({trials}) + ({phi})) - ",
+          "inv(1.0 + ({phi}))))"
+        )
+      }
+    }
+  } else if (family == "dirichlet2") {
+    mu_dpars <- names(bframe$dpars)[vapply(
+      names(bframe$dpars),
+      function(dp) identical(dpar_class(dp, bframe$family), "mu"),
+      logical(1)
+    )]
+    alpha_refs <- lapply(mu_dpars, function(dp) ref(dp))
+    alpha_values <- vapply(alpha_refs, `[[`, character(1), "value")
+    alpha_sum <- paste(alpha_values, collapse = " + ")
+    if (dpar %in% mu_dpars) {
+      own_info <- if (identical(target$link, "log")) {
+        scaled_trigamma(value)
+      } else {
+        glue(
+          "square(({derivative}) / fmax({value}, 1e-12)) * ",
+          "{scaled_trigamma(value)}"
+        )
+      }
+      out <- glue(
+        "fmax(0.0, ({own_info}) - {sq_chain} * trigamma({alpha_sum}))"
+      )
+    }
+  } else if (family == "beta_binomial") {
+    mu <- ref("mu")$value
+    dmu <- ref("mu")$derivative
+    phi <- ref("phi")$value
+    dphi <- ref("phi")$derivative
+    trials <- glue("trials{resp}[{n}]")
+    definitions <- c(definitions, glue(
+      "        real prob_fisher_s2z_bb = fmin(1.0 - 1e-12, ",
+      "fmax(1e-12, {mu}));\n",
+      "        real alpha_fisher_s2z_bb = prob_fisher_s2z_bb * ({phi});\n",
+      "        real beta_fisher_s2z_bb = ",
+      "(1.0 - prob_fisher_s2z_bb) * ({phi});\n",
+      "        real log_p0_fisher_s2z_bb = ",
+      "lbeta(alpha_fisher_s2z_bb, beta_fisher_s2z_bb + ({trials})) - ",
+      "lbeta(alpha_fisher_s2z_bb, beta_fisher_s2z_bb);\n",
+      "        real log_pn_fisher_s2z_bb = ",
+      "lbeta(alpha_fisher_s2z_bb + ({trials}), beta_fisher_s2z_bb) - ",
+      "lbeta(alpha_fisher_s2z_bb, beta_fisher_s2z_bb);\n",
+      "        real p0_fisher_s2z_bb = exp(log_p0_fisher_s2z_bb);\n",
+      "        real pn_fisher_s2z_bb = exp(log_pn_fisher_s2z_bb);\n",
+      "        real pmid_fisher_s2z_bb = fmax(0.0, ",
+      "1.0 - p0_fisher_s2z_bb - pn_fisher_s2z_bb);\n"
+    ))
+    if (dpar == "mu") {
+      definitions <- c(definitions, glue(
+        "        real score0_fisher_s2z_bb = ({dmu}) * ({phi}) * (",
+        "digamma(beta_fisher_s2z_bb) - ",
+        "digamma(beta_fisher_s2z_bb + ({trials})));\n",
+        "        real scoren_fisher_s2z_bb = ({dmu}) * ({phi}) * (",
+        "digamma(alpha_fisher_s2z_bb + ({trials})) - ",
+        "digamma(alpha_fisher_s2z_bb));\n"
+      ))
+    } else if (dpar == "phi") {
+      definitions <- c(definitions, glue(
+        "        real score0_fisher_s2z_bb = ({dphi}) * (",
+        "digamma({phi}) - digamma(({phi}) + ({trials})) + ",
+        "(1.0 - prob_fisher_s2z_bb) * (",
+        "digamma(beta_fisher_s2z_bb + ({trials})) - ",
+        "digamma(beta_fisher_s2z_bb)));\n",
+        "        real scoren_fisher_s2z_bb = ({dphi}) * (",
+        "digamma({phi}) - digamma(({phi}) + ({trials})) + ",
+        "prob_fisher_s2z_bb * (",
+        "digamma(alpha_fisher_s2z_bb + ({trials})) - ",
+        "digamma(alpha_fisher_s2z_bb)));\n"
+      ))
+    }
+    if (dpar %in% c("mu", "phi")) {
+      definitions <- c(definitions, glue(
+        "        real dpmid_fisher_s2z_bb = -p0_fisher_s2z_bb * ",
+        "score0_fisher_s2z_bb - pn_fisher_s2z_bb * ",
+        "scoren_fisher_s2z_bb;\n"
+      ))
+      coarse_info <- glue(
+        "p0_fisher_s2z_bb * square(score0_fisher_s2z_bb) + ",
+        "pn_fisher_s2z_bb * square(scoren_fisher_s2z_bb) + ",
+        "square(dpmid_fisher_s2z_bb) / ",
+        "fmax(pmid_fisher_s2z_bb, 1e-12)"
+      )
+      out <- if (dpar == "mu") {
+        glue(
+          "({trials} == 0 ? 0.0 : ({trials} == 1 ? ",
+          "({binary_information(ref('mu'))}) : ({coarse_info})))"
+        )
+      } else {
+        glue("({trials} <= 1 ? 0.0 : ({coarse_info}))")
+      }
+    }
+  } else if (family == "poisson") {
+    if (dpar == "mu") {
+      lambda <- scaled(value)
+      dlambda <- scaled_derivative(derivative)
+      out <- if (identical(target$link, "log")) {
+        lambda
+      } else {
+        glue("square({dlambda}) / fmax({lambda}, 1e-12)")
+      }
+    }
+  } else if (family %in% c("negbinomial", "negbinomial2", "geometric")) {
+    if (dpar == "mu") {
+      mu <- scaled(value)
+      dmu <- scaled_derivative(derivative)
+      shape <- if (family == "geometric") {
+        scaled("1.0")
+      } else if (family == "negbinomial") {
+        scaled(ref("shape")$value)
+      } else {
+        scaled(glue("inv({ref('sigma')$value})"))
+      }
+      out <- if (identical(target$link, "log")) {
+        glue("({mu}) * {shape} / (({mu}) + {shape})")
+      } else {
+        glue(
+          "square({dmu}) * {shape} / ",
+          "fmax(({mu}) * (({mu}) + {shape}), 1e-12)"
+        )
+      }
+    } else if (family %in% c("negbinomial", "negbinomial2")) {
+      # The exact expected information for log(shape) contains
+      # E[trigamma(Y + shape)].  Avoid evaluating that expectation in Stan by
+      # using a positive closed-form moment approximation.  It is exact to
+      # leading order as mu -> 0, includes the exact information in the event
+      # Y == 0, and approaches the Gaussian variance-information limit as the
+      # zero probability vanishes.
+      mu <- scaled(ref("mu")$value)
+      if (family == "negbinomial") {
+        shape <- scaled(value)
+        log_shape_chain <- glue("({derivative}) / ({value})")
+      } else {
+        shape <- scaled(glue("inv({value})"))
+        log_shape_chain <- glue("-({derivative}) / ({value})")
+      }
+      definitions <- c(definitions, glue(
+        "        real mean_fraction_fisher_s2z_nb = ",
+        "{mu} / ({mu} + {shape});\n",
+        "        real log_p0_fisher_s2z_nb = -({shape}) * ",
+        "log1p(({mu}) / ({shape}));\n",
+        "        real p0_fisher_s2z_nb = exp(log_p0_fisher_s2z_nb);\n",
+        "        real ppos_fisher_s2z_nb = ",
+        "-expm1(log_p0_fisher_s2z_nb);\n",
+        "        real dlog_p0_fisher_s2z_nb = ({shape}) * ",
+        "(-log1p(({mu}) / ({shape})) + ",
+        "mean_fraction_fisher_s2z_nb);\n",
+        "        real sparse_info_fisher_s2z_nb = 0.5 * ({shape}) / ",
+        "(({shape}) + 1.0) * square(mean_fraction_fisher_s2z_nb);\n",
+        "        real dense_info_fisher_s2z_nb = 0.5 * ",
+        "square(mean_fraction_fisher_s2z_nb);\n",
+        "        real zero_info_fisher_s2z_nb = p0_fisher_s2z_nb * ",
+        "square(dlog_p0_fisher_s2z_nb) / ",
+        "fmax(ppos_fisher_s2z_nb, 1e-12);\n",
+        "        real log_shape_info_fisher_s2z_nb = ",
+        "sparse_info_fisher_s2z_nb + zero_info_fisher_s2z_nb + ",
+        "ppos_fisher_s2z_nb * (dense_info_fisher_s2z_nb - ",
+        "sparse_info_fisher_s2z_nb);\n"
+      ))
+      out <- glue(
+        "square({log_shape_chain}) * log_shape_info_fisher_s2z_nb"
+      )
+    }
+  } else if (family == "discrete_weibull") {
+    mu <- ref("mu")$value
+    shape <- ref("shape")$value
+    definitions <- c(definitions, glue(
+      "        real prob_fisher_s2z_dw = fmin(1.0 - 1e-12, ",
+      "fmax(1e-12, {mu}));\n",
+      "        real tail_power_fisher_s2z_dw = pow(2.0, {shape});\n",
+      "        real log_tail_prob_fisher_s2z_dw = ",
+      "tail_power_fisher_s2z_dw * log(prob_fisher_s2z_dw);\n",
+      "        real p2_fisher_s2z_dw = exp(log_tail_prob_fisher_s2z_dw);\n",
+      "        real p1_fisher_s2z_dw = ",
+      "fmax(0.0, prob_fisher_s2z_dw - p2_fisher_s2z_dw);\n",
+      "        real p0_fisher_s2z_dw = 1.0 - prob_fisher_s2z_dw;\n"
+    ))
+    out <- switch(dpar,
+      mu = glue(
+        "{sq_chain} * (inv(fmax(p0_fisher_s2z_dw, 1e-12)) + ",
+        "square(1.0 - tail_power_fisher_s2z_dw * p2_fisher_s2z_dw / ",
+        "prob_fisher_s2z_dw) / fmax(p1_fisher_s2z_dw, 1e-12) + ",
+        "square(tail_power_fisher_s2z_dw * p2_fisher_s2z_dw / ",
+        "prob_fisher_s2z_dw) / fmax(p2_fisher_s2z_dw, 1e-12))"
+      ),
+      shape = glue(
+        "{sq_chain} * square(p2_fisher_s2z_dw * ",
+        "tail_power_fisher_s2z_dw * log(prob_fisher_s2z_dw) * ",
+        "log(2.0)) * ",
+        "(inv(fmax(p1_fisher_s2z_dw, 1e-12)) + ",
+        "inv(fmax(p2_fisher_s2z_dw, 1e-12)))"
+      ),
+      NULL
+    )
+  } else if (family == "com_poisson") {
+    # The generated Stan likelihood is the standard COM-Poisson exponential
+    # family p(y) proportional to mu^y / (y!)^shape.  Its exact information is
+    # the covariance of (Y, log(Y!)) and would require differentiating the
+    # log-normalizer.  Use its standard asymptotic variance together with a
+    # positive second-order delta approximation for Var(log(Y!)).  This is
+    # response-free, reduces exactly to Poisson location information at
+    # shape = 1, and adds no normalizer evaluation to the autodiff graph.
+    mu <- ref("mu")$value
+    dmu <- ref("mu")$derivative
+    shape <- ref("shape")$value
+    dshape <- ref("shape")$derivative
+    definitions <- c(definitions, glue(
+      "        real log_mode_fisher_s2z_cmp = log(fmax({mu}, 1e-12)) / ",
+      "fmax({shape}, 1e-12);\n",
+      "        real mode_fisher_s2z_cmp = exp(fmin(27.6310211159, ",
+      "fmax(-27.6310211159, log_mode_fisher_s2z_cmp)));\n",
+      "        real variance_fisher_s2z_cmp = fmin(1e12, ",
+      "mode_fisher_s2z_cmp / fmax({shape}, 1e-12));\n",
+      "        real log_factorial_slope_fisher_s2z_cmp = ",
+      "digamma(mode_fisher_s2z_cmp + 1.0);\n",
+      "        real log_factorial_curve_fisher_s2z_cmp = ",
+      "trigamma(mode_fisher_s2z_cmp + 1.0);\n",
+      "        real log_factorial_variance_fisher_s2z_cmp = ",
+      "square(log_factorial_slope_fisher_s2z_cmp) * ",
+      "variance_fisher_s2z_cmp + 0.5 * ",
+      "square(log_factorial_curve_fisher_s2z_cmp) * ",
+      "square(variance_fisher_s2z_cmp);\n"
+    ))
+    out <- switch(dpar,
+      mu = if (identical(ref("mu")$link, "log")) {
+        "variance_fisher_s2z_cmp"
+      } else {
+        glue(
+          "square(({dmu}) / fmax({mu}, 1e-12)) * ",
+          "variance_fisher_s2z_cmp"
+        )
+      },
+      shape = glue(
+        "square({dshape}) * log_factorial_variance_fisher_s2z_cmp"
+      ),
+      NULL
+    )
+  } else if (family == "gamma") {
+    mu <- ref("mu")$value
+    shape <- ref("shape")$value
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * {shape} * inv_square({mu})"),
+      shape = glue(
+        "{sq_chain} * fmax(0.0, trigamma({shape}) - inv({shape}))"
+      ),
+      NULL
+    )
+  } else if (family == "exponential") {
+    if (dpar == "mu") {
+      out <- glue("{sq_chain} * inv_square({value})")
+    }
+  } else if (family == "inverse.gaussian") {
+    mu <- ref("mu")$value
+    shape <- ref("shape")$value
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * {shape} / pow({mu}, 3)"),
+      shape = glue("0.5 * {sq_chain} * inv_square({shape})"),
+      NULL
+    )
+  } else if (family == "wiener") {
+    if (dpar %in% c("mu", "bs", "bias")) {
+      drift <- ref("mu")$value
+      boundary <- ref("bs")$value
+      bias <- ref("bias")$value
+      start <- glue("(({boundary}) * ({bias}))")
+      definitions <- c(definitions, glue(
+        "        real choice_scale_fisher_s2z_wiener = ",
+        "2.0 * ({drift}) * ({boundary});\n",
+        "        real p_upper_fisher_s2z_wiener;\n",
+        "        real dp_dscale_fisher_s2z_wiener;\n",
+        "        real dp_dbias_fisher_s2z_wiener;\n",
+        "        if (abs(choice_scale_fisher_s2z_wiener) < 1e-5) {{\n",
+        "          p_upper_fisher_s2z_wiener = ({bias}) + 0.5 * ",
+        "({bias}) * (1.0 - ({bias})) * ",
+        "choice_scale_fisher_s2z_wiener;\n",
+        "          dp_dscale_fisher_s2z_wiener = ",
+        "0.5 * ({bias}) * (1.0 - ({bias}));\n",
+        "          dp_dbias_fisher_s2z_wiener = 1.0 + 0.5 * ",
+        "(1.0 - 2.0 * ({bias})) * choice_scale_fisher_s2z_wiener;\n",
+        "        }} else {{\n",
+        "          if (choice_scale_fisher_s2z_wiener > 0.0) {{\n",
+        "            p_upper_fisher_s2z_wiener = ",
+        "-expm1(-({bias}) * choice_scale_fisher_s2z_wiener) / ",
+        "-expm1(-choice_scale_fisher_s2z_wiener);\n",
+        "            dp_dbias_fisher_s2z_wiener = ",
+        "choice_scale_fisher_s2z_wiener * exp(-({bias}) * ",
+        "choice_scale_fisher_s2z_wiener) / ",
+        "-expm1(-choice_scale_fisher_s2z_wiener);\n",
+        "          }} else {{\n",
+        "            real abs_scale_fisher_s2z_wiener = ",
+        "-choice_scale_fisher_s2z_wiener;\n",
+        "            p_upper_fisher_s2z_wiener = exp(-(1.0 - ({bias})) * ",
+        "abs_scale_fisher_s2z_wiener) * ",
+        "-expm1(-({bias}) * abs_scale_fisher_s2z_wiener) / ",
+        "-expm1(-abs_scale_fisher_s2z_wiener);\n",
+        "            dp_dbias_fisher_s2z_wiener = ",
+        "abs_scale_fisher_s2z_wiener * exp(-(1.0 - ({bias})) * ",
+        "abs_scale_fisher_s2z_wiener) / ",
+        "-expm1(-abs_scale_fisher_s2z_wiener);\n",
+        "          }}\n",
+        "          dp_dscale_fisher_s2z_wiener = ",
+        "p_upper_fisher_s2z_wiener * (",
+        "({bias}) / expm1(({bias}) * choice_scale_fisher_s2z_wiener) - ",
+        "inv(expm1(choice_scale_fisher_s2z_wiener)));\n",
+        "        }}\n",
+        "        real prob_safe_fisher_s2z_wiener = ",
+        "fmin(1.0 - 1e-12, fmax(1e-12, ",
+        "p_upper_fisher_s2z_wiener));\n"
+      ))
+      if (dpar == "mu") {
+        definitions <- c(definitions, glue(
+          "        real mean_time_fisher_s2z_wiener;\n",
+          "        if (abs(({drift}) * ({boundary})) < 1e-5) {{\n",
+          "          mean_time_fisher_s2z_wiener = ({start}) * ",
+          "(({boundary}) - ({start}));\n",
+          "        }} else {{\n",
+          "          mean_time_fisher_s2z_wiener = (({boundary}) * ",
+          "p_upper_fisher_s2z_wiener - ({start})) / ({drift});\n",
+          "        }}\n"
+        ))
+        out <- glue(
+          "{sq_chain} * fmax(0.0, mean_time_fisher_s2z_wiener)"
+        )
+      } else if (dpar == "bs") {
+        out <- glue(
+          "square(({derivative}) * 2.0 * ({drift}) * ",
+          "dp_dscale_fisher_s2z_wiener) / ",
+          "fmax(prob_safe_fisher_s2z_wiener * ",
+          "(1.0 - prob_safe_fisher_s2z_wiener), 1e-12)"
+        )
+      } else {
+        out <- glue(
+          "square(({derivative}) * dp_dbias_fisher_s2z_wiener) / ",
+          "fmax(prob_safe_fisher_s2z_wiener * ",
+          "(1.0 - prob_safe_fisher_s2z_wiener), 1e-12)"
+        )
+      }
+    }
+  } else if (family == "beta") {
+    mu <- ref("mu")$value
+    dmu <- ref("mu")$derivative
+    phi <- ref("phi")$value
+    a <- glue("({mu}) * ({phi})")
+    b <- glue("(1.0 - ({mu})) * ({phi})")
+    mu_info <- if (identical(ref("mu")$link, "logit")) {
+      glue(
+        "square(1.0 - ({mu})) * {scaled_trigamma(a)} + ",
+        "square({mu}) * {scaled_trigamma(b)}"
+      )
+    } else {
+      glue(
+        "square(({dmu}) / fmax({mu}, 1e-12)) * ",
+        "{scaled_trigamma(a)} + square(({dmu}) / ",
+        "fmax(1.0 - ({mu}), 1e-12)) * {scaled_trigamma(b)}"
+      )
+    }
+    out <- switch(dpar,
+      mu = mu_info,
+      phi = glue(
+        "{sq_chain} * fmax(0.0, ({scaled_trigamma(a)} + ",
+        "{scaled_trigamma(b)}) * inv_square({phi}) - trigamma({phi}))"
+      ),
+      NULL
+    )
+  } else if (family == "weibull") {
+    shape <- ref("shape")$value
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * square({shape}) * inv_square({value})"),
+      shape = glue(
+        "{sq_chain} * (square(pi()) / 6.0 + square(",
+        "digamma(1.0 + inv({shape})) - (1.0 + digamma(1.0)))) * ",
+        "inv_square({shape})"
+      ),
+      NULL
+    )
+  } else if (family == "frechet") {
+    nu <- ref("nu")$value
+    definitions <- c(definitions, glue(
+      "        real boundary_fraction_fisher_s2z_frechet = ",
+      "(({nu}) - 1.0) / ({nu});\n",
+      "        real scaled_shape_score_fisher_s2z_frechet = ",
+      "boundary_fraction_fisher_s2z_frechet < 1e-6 ? ",
+      "-1.0 - boundary_fraction_fisher_s2z_frechet + ",
+      "square(pi()) / 6.0 * ",
+      "square(boundary_fraction_fisher_s2z_frechet) : ",
+      "boundary_fraction_fisher_s2z_frechet * (digamma(",
+      "boundary_fraction_fisher_s2z_frechet) - ",
+      "(1.0 + digamma(1.0)));\n",
+      "        real shape_info_fisher_s2z_frechet = ",
+      "square(scaled_shape_score_fisher_s2z_frechet) + ",
+      "square(pi()) / 6.0 * ",
+      "square(boundary_fraction_fisher_s2z_frechet);\n"
+    ))
+    nu_info <- if (identical(ref("nu")$link, "logm1")) {
+      "shape_info_fisher_s2z_frechet"
+    } else {
+      glue(
+        "square(({derivative}) / fmax(({nu}) - 1.0, 1e-12)) * ",
+        "shape_info_fisher_s2z_frechet"
+      )
+    }
+    out <- switch(dpar,
+      mu = glue("{sq_chain} * square({nu}) * inv_square({value})"),
+      nu = nu_info,
+      NULL
+    )
+  } else if (family == "exgaussian") {
+    sigma <- ref("sigma")$value
+    beta <- ref("beta")$value
+    variance <- glue("(square({sigma}) + square({beta}))")
+    definitions <- c(definitions, glue(
+      "        real dskew_sigma_fisher_s2z_exg = -6.0 * ",
+      "pow({beta}, 3) * ({sigma}) * pow({variance}, -2.5);\n",
+      "        real dskew_beta_fisher_s2z_exg = 6.0 * ",
+      "square({beta}) * square({sigma}) * pow({variance}, -2.5);\n",
+      "        real dkurt_sigma_fisher_s2z_exg = -24.0 * ",
+      "pow({beta}, 4) * ({sigma}) * pow({variance}, -3.0);\n",
+      "        real dkurt_beta_fisher_s2z_exg = 24.0 * ",
+      "pow({beta}, 3) * square({sigma}) * pow({variance}, -3.0);\n"
+    ))
+    out <- switch(dpar,
+      mu = glue("{sq_chain} / {variance}"),
+      sigma = glue(
+        "{sq_chain} * (2.0 * square({sigma}) / square({variance}) + ",
+        "square(dskew_sigma_fisher_s2z_exg) / 6.0 + ",
+        "square(dkurt_sigma_fisher_s2z_exg) / 24.0)"
+      ),
+      beta = glue(
+        "{sq_chain} * (2.0 * square({beta}) / square({variance}) + ",
+        "square(dskew_beta_fisher_s2z_exg) / 6.0 + ",
+        "square(dkurt_beta_fisher_s2z_exg) / 24.0)"
+      ),
+      NULL
+    )
+  } else if (family == "xbeta") {
+    mu <- ref("mu")$value
+    phi <- ref("phi")$value
+    kappa <- ref("kappa")$value
+    extension <- glue("(1.0 + 2.0 * ({kappa}))")
+    definitions <- c(definitions, glue(
+      "        real prob_fisher_s2z_xbeta = fmin(1.0 - 1e-12, ",
+      "fmax(1e-12, {mu}));\n"
+    ))
+    variance <- glue(
+      "(square({extension}) * prob_fisher_s2z_xbeta * ",
+      "(1.0 - prob_fisher_s2z_xbeta) / ",
+      "(1.0 + ({phi})))"
+    )
+    mu_info <- if (identical(ref("mu")$link, "logit")) {
+      glue(
+        "(1.0 + ({phi})) * ({mu}) * (1.0 - ({mu})) + ",
+        "0.5 * square(1.0 - 2.0 * ({mu}))"
+      )
+    } else {
+      glue(
+        "{sq_chain} * (square({extension}) / fmax({variance}, 1e-12) + ",
+        "0.5 * square((1.0 - 2.0 * prob_fisher_s2z_xbeta) / ",
+        "(prob_fisher_s2z_xbeta * ",
+        "(1.0 - prob_fisher_s2z_xbeta))))"
+      )
+    }
+    out <- switch(dpar,
+      mu = mu_info,
+      phi = glue(
+        "0.5 * {sq_chain} * inv_square(1.0 + ({phi}))"
+      ),
+      kappa = glue(
+        "{sq_chain} * (square(2.0 * prob_fisher_s2z_xbeta - 1.0) / ",
+        "fmax({variance}, 1e-12) + ",
+        "8.0 * inv_square({extension}))"
+      ),
+      NULL
+    )
+  } else if (family == "von_mises") {
+    kappa <- ref("kappa")$value
+    # Differentiate the rational approximation to I1(kappa) / I0(kappa)
+    # directly. This preserves the exact 1/2 endpoint at zero and the leading
+    # 1 / (2 kappa^2) concentration-information limit without Bessel calls.
+    definitions <- c(definitions, glue(
+      "        real denominator_fisher_s2z_vm = ",
+      "6.0 + 4.0 * ({kappa}) + 2.0 * square({kappa});\n",
+      "        real mean_cosine_over_kappa_fisher_s2z_vm = ",
+      "(3.0 + 2.0 * ({kappa})) / ",
+      "denominator_fisher_s2z_vm;\n",
+      "        real mean_cosine_fisher_s2z_vm = ({kappa}) * ",
+      "mean_cosine_over_kappa_fisher_s2z_vm;\n",
+      "        real mean_cosine_derivative_fisher_s2z_vm = ",
+      "(18.0 + 24.0 * ({kappa}) + 2.0 * square({kappa})) / ",
+      "square(denominator_fisher_s2z_vm);\n"
+    ))
+    out <- switch(dpar,
+      mu = glue(
+        "{sq_chain} * ({kappa}) * mean_cosine_fisher_s2z_vm"
+      ),
+      kappa = glue(
+        "{sq_chain} * mean_cosine_derivative_fisher_s2z_vm"
+      ),
+      NULL
+    )
+  } else if (family == "asym_laplace") {
+    sigma <- ref("sigma")$value
+    quantile <- ref("quantile")$value
+    out <- switch(dpar,
+      mu = glue(
+        "{sq_chain} * {quantile} * (1.0 - {quantile}) * ",
+        "inv_square({sigma})"
+      ),
+      sigma = glue("{sq_chain} * inv_square({value})"),
+      quantile = quantile_information(target),
+      NULL
+    )
+  } else if (family == "cox") {
+    if (dpar == "mu") {
+      # Unit information on the ideal log-rate exponential clock. brms uses a
+      # bounded spline baseline, so this is a response-free working target,
+      # not the exact finite-horizon Fisher information.
+      out <- if (identical(target$link, "log")) {
+        "1.0"
+      } else {
+        glue("square(({derivative}) / fmax({value}, 1e-12))")
+      }
+    }
+  } else if (family %in% c("hurdle_gamma", "hurdle_lognormal")) {
+    hu <- ref("hu")$value
+    if (dpar == "hu") {
+      out <- binary_information(ref("hu"))
+    } else if (family == "hurdle_gamma") {
+      mu <- ref("mu")$value
+      shape <- ref("shape")$value
+      out <- switch(dpar,
+        mu = glue(
+          "(1.0 - {hu}) * {sq_chain} * {shape} * inv_square({mu})"
+        ),
+        shape = glue(
+          "(1.0 - {hu}) * {sq_chain} * fmax(0.0, ",
+          "trigamma({shape}) - inv({shape}))"
+        ),
+        NULL
+      )
+    } else {
+      sigma <- ref("sigma")$value
+      out <- switch(dpar,
+        mu = glue("(1.0 - {hu}) * {sq_chain} * inv_square({sigma})"),
+        sigma = glue("(1.0 - {hu}) * 2.0 * {sq_chain} * inv_square({value})"),
+        NULL
+      )
+    }
+  } else if (family %in% c("hurdle_poisson", "hurdle_negbinomial")) {
+    hu <- ref("hu")$value
+    if (dpar == "hu") {
+      out <- binary_information(ref("hu"))
+    } else if (family == "hurdle_poisson" && dpar == "mu") {
+      lambda <- ref("mu")$value
+      dlambda <- ref("mu")$derivative
+      poisson_info <- if (identical(ref("mu")$link, "log")) {
+        lambda
+      } else {
+        glue("square({dlambda}) / fmax({lambda}, 1e-12)")
+      }
+      definitions <- c(definitions, glue(
+        "        real p0_fisher_s2z_hp = exp(-({lambda}));\n",
+        "        real ppos_fisher_s2z_hp = -expm1(-({lambda}));\n",
+        "        real base_info_fisher_s2z_hp = ",
+        "{poisson_info};\n",
+        "        real zero_score_fisher_s2z_hp = -({dlambda});\n",
+        "        real positive_info_fisher_s2z_hp = fmax(0.0, ",
+        "base_info_fisher_s2z_hp - p0_fisher_s2z_hp * ",
+        "square(zero_score_fisher_s2z_hp) / ",
+        "fmax(ppos_fisher_s2z_hp, 1e-12));\n"
+      ))
+      out <- glue(
+        "(1.0 - {hu}) * positive_info_fisher_s2z_hp / ",
+        "fmax(ppos_fisher_s2z_hp, 1e-12)"
+      )
+    } else if (family == "hurdle_negbinomial" &&
+               dpar %in% c("mu", "shape")) {
+      mu <- ref("mu")$value
+      shape <- ref("shape")$value
+      dmu <- ref("mu")$derivative
+      dshape <- ref("shape")$derivative
+      definitions <- c(definitions, glue(
+        "        real mean_fraction_fisher_s2z_hnb = ",
+        "({mu}) / (({mu}) + ({shape}));\n",
+        "        real log_p0_fisher_s2z_hnb = -({shape}) * ",
+        "log1p(({mu}) / ({shape}));\n",
+        "        real p0_fisher_s2z_hnb = exp(log_p0_fisher_s2z_hnb);\n",
+        "        real ppos_fisher_s2z_hnb = ",
+        "-expm1(log_p0_fisher_s2z_hnb);\n"
+      ))
+      if (dpar == "mu") {
+        nb_mean_info <- if (identical(ref("mu")$link, "log")) {
+          glue("({mu}) * ({shape}) / (({mu}) + ({shape}))")
+        } else {
+          glue(
+            "square({dmu}) * ({shape}) / fmax(({mu}) * ",
+            "(({mu}) + ({shape})), 1e-12)"
+          )
+        }
+        definitions <- c(definitions, glue(
+          "        real base_info_fisher_s2z_hnb = {nb_mean_info};\n",
+          "        real zero_score_fisher_s2z_hnb = -({dmu}) * ",
+          "({shape}) / (({mu}) + ({shape}));\n"
+        ))
+      } else {
+        definitions <- c(definitions, glue(
+          "        real dlog_p0_log_shape_fisher_s2z_hnb = ({shape}) * ",
+          "(-log1p(({mu}) / ({shape})) + ",
+          "mean_fraction_fisher_s2z_hnb);\n",
+          "        real sparse_info_fisher_s2z_hnb = 0.5 * ({shape}) / ",
+          "(({shape}) + 1.0) * square(mean_fraction_fisher_s2z_hnb);\n",
+          "        real dense_info_fisher_s2z_hnb = 0.5 * ",
+          "square(mean_fraction_fisher_s2z_hnb);\n",
+          "        real zero_info_fisher_s2z_hnb = p0_fisher_s2z_hnb * ",
+          "square(dlog_p0_log_shape_fisher_s2z_hnb) / ",
+          "fmax(ppos_fisher_s2z_hnb, 1e-12);\n",
+          "        real log_shape_info_fisher_s2z_hnb = ",
+          "sparse_info_fisher_s2z_hnb + zero_info_fisher_s2z_hnb + ",
+          "ppos_fisher_s2z_hnb * (dense_info_fisher_s2z_hnb - ",
+          "sparse_info_fisher_s2z_hnb);\n",
+          "        real log_shape_chain_fisher_s2z_hnb = ",
+          "({dshape}) / ({shape});\n",
+          "        real base_info_fisher_s2z_hnb = ",
+          "square(log_shape_chain_fisher_s2z_hnb) * ",
+          "log_shape_info_fisher_s2z_hnb;\n",
+          "        real zero_score_fisher_s2z_hnb = ",
+          "log_shape_chain_fisher_s2z_hnb * ",
+          "dlog_p0_log_shape_fisher_s2z_hnb;\n"
+        ))
+      }
+      definitions <- c(definitions, glue(
+        "        real positive_info_fisher_s2z_hnb = fmax(0.0, ",
+        "base_info_fisher_s2z_hnb - p0_fisher_s2z_hnb * ",
+        "square(zero_score_fisher_s2z_hnb) / ",
+        "fmax(ppos_fisher_s2z_hnb, 1e-12));\n"
+      ))
+      out <- glue(
+        "(1.0 - {hu}) * positive_info_fisher_s2z_hnb / ",
+        "fmax(ppos_fisher_s2z_hnb, 1e-12)"
+      )
+    }
+  } else if (family %in% c(
+    "zero_inflated_poisson", "zero_inflated_negbinomial",
+    "zero_inflated_binomial", "zero_inflated_beta_binomial"
+  )) {
+    zi <- ref("zi")$value
+    dzi <- ref("zi")$derivative
+    if (family == "zero_inflated_poisson") {
+      base_value <- ref("mu")$value
+      base_derivative <- ref("mu")$derivative
+      definitions <- c(definitions, glue(
+        "        real p0_fisher_s2z_zi = exp(-({base_value}));\n",
+        "        real ppos_fisher_s2z_zi = -expm1(-({base_value}));\n",
+        "        real q0_fisher_s2z_zi = ({zi}) + ",
+        "(1.0 - ({zi})) * p0_fisher_s2z_zi;\n",
+        "        real qpos_fisher_s2z_zi = ",
+        "(1.0 - ({zi})) * ppos_fisher_s2z_zi;\n"
+      ))
+      if (dpar == "mu") {
+        poisson_info <- if (identical(ref("mu")$link, "log")) {
+          base_value
+        } else {
+          glue(
+            "square({base_derivative}) / fmax({base_value}, 1e-12)"
+          )
+        }
+        definitions <- c(definitions, glue(
+          "        real base_info_fisher_s2z_zi = ",
+          "{poisson_info};\n",
+          "        real zero_score_fisher_s2z_zi = -({base_derivative});\n"
+        ))
+      }
+    } else if (family == "zero_inflated_binomial") {
+      prob <- ref("mu")$value
+      dprob <- ref("mu")$derivative
+      trials <- glue("trials{resp}[{n}]")
+      definitions <- c(definitions, glue(
+        "        real log_p0_fisher_s2z_zi = ({trials}) == 0 ? ",
+        "0.0 : ({trials}) * log1m({prob});\n",
+        "        real p0_fisher_s2z_zi = exp(log_p0_fisher_s2z_zi);\n",
+        "        real ppos_fisher_s2z_zi = ",
+        "-expm1(log_p0_fisher_s2z_zi);\n",
+        "        real q0_fisher_s2z_zi = ({zi}) + ",
+        "(1.0 - ({zi})) * p0_fisher_s2z_zi;\n",
+        "        real qpos_fisher_s2z_zi = ",
+        "(1.0 - ({zi})) * ppos_fisher_s2z_zi;\n"
+      ))
+      if (dpar == "mu") {
+        binomial_info <- binary_information(ref("mu"))
+        zero_score <- if (identical(ref("mu")$link, "logit")) {
+          glue("-({trials}) * ({prob})")
+        } else {
+          glue(
+            "-({trials}) * ({dprob}) / fmax(1.0 - ({prob}), 1e-12)"
+          )
+        }
+        definitions <- c(definitions, glue(
+          "        real base_info_fisher_s2z_zi = ({trials}) * ",
+          "({binomial_info});\n",
+          "        real zero_score_fisher_s2z_zi = {zero_score};\n"
+        ))
+      }
+    } else if (family == "zero_inflated_beta_binomial") {
+      prob <- ref("mu")$value
+      dprob <- ref("mu")$derivative
+      phi <- ref("phi")$value
+      dphi <- ref("phi")$derivative
+      trials <- glue("trials{resp}[{n}]")
+      definitions <- c(definitions, glue(
+        "        real prob_safe_fisher_s2z_zibb = fmin(1.0 - 1e-12, ",
+        "fmax(1e-12, {prob}));\n",
+        "        real alpha_fisher_s2z_zibb = ",
+        "prob_safe_fisher_s2z_zibb * ({phi});\n",
+        "        real beta_fisher_s2z_zibb = ",
+        "(1.0 - prob_safe_fisher_s2z_zibb) * ({phi});\n",
+        "        real log_p0_fisher_s2z_zi = ",
+        "lbeta(alpha_fisher_s2z_zibb, beta_fisher_s2z_zibb + ",
+        "({trials})) - lbeta(alpha_fisher_s2z_zibb, ",
+        "beta_fisher_s2z_zibb);\n",
+        "        real log_pn_fisher_s2z_zibb = ",
+        "lbeta(alpha_fisher_s2z_zibb + ({trials}), ",
+        "beta_fisher_s2z_zibb) - lbeta(alpha_fisher_s2z_zibb, ",
+        "beta_fisher_s2z_zibb);\n",
+        "        real p0_fisher_s2z_zi = exp(log_p0_fisher_s2z_zi);\n",
+        "        real pn_fisher_s2z_zibb = exp(log_pn_fisher_s2z_zibb);\n",
+        "        real pmid_fisher_s2z_zibb = fmax(0.0, ",
+        "1.0 - p0_fisher_s2z_zi - pn_fisher_s2z_zibb);\n",
+        "        real ppos_fisher_s2z_zi = ",
+        "-expm1(log_p0_fisher_s2z_zi);\n",
+        "        real q0_fisher_s2z_zi = ({zi}) + ",
+        "(1.0 - ({zi})) * p0_fisher_s2z_zi;\n",
+        "        real qpos_fisher_s2z_zi = ",
+        "(1.0 - ({zi})) * ppos_fisher_s2z_zi;\n"
+      ))
+      if (dpar == "mu") {
+        definitions <- c(definitions, glue(
+          "        real zero_score_fisher_s2z_zi = ({dprob}) * ",
+          "({phi}) * (digamma(beta_fisher_s2z_zibb) - ",
+          "digamma(beta_fisher_s2z_zibb + ({trials})));\n",
+          "        real end_score_fisher_s2z_zibb = ({dprob}) * ",
+          "({phi}) * (digamma(alpha_fisher_s2z_zibb + ({trials})) - ",
+          "digamma(alpha_fisher_s2z_zibb));\n"
+        ))
+      } else if (dpar == "phi") {
+        definitions <- c(definitions, glue(
+          "        real zero_score_fisher_s2z_zi = ({dphi}) * (",
+          "digamma({phi}) - digamma(({phi}) + ({trials})) + ",
+          "(1.0 - prob_safe_fisher_s2z_zibb) * (",
+          "digamma(beta_fisher_s2z_zibb + ",
+          "({trials})) - digamma(beta_fisher_s2z_zibb)));\n",
+          "        real end_score_fisher_s2z_zibb = ({dphi}) * (",
+          "digamma({phi}) - digamma(({phi}) + ({trials})) + ",
+          "prob_safe_fisher_s2z_zibb * (",
+          "digamma(alpha_fisher_s2z_zibb + ({trials})) - ",
+          "digamma(alpha_fisher_s2z_zibb)));\n"
+        ))
+      }
+      if (dpar %in% c("mu", "phi")) {
+        definitions <- c(definitions, glue(
+          "        real dpmid_fisher_s2z_zibb = -p0_fisher_s2z_zi * ",
+          "zero_score_fisher_s2z_zi - pn_fisher_s2z_zibb * ",
+          "end_score_fisher_s2z_zibb;\n",
+          "        real coarse_info_fisher_s2z_zibb = ",
+          "p0_fisher_s2z_zi * square(zero_score_fisher_s2z_zi) + ",
+          "pn_fisher_s2z_zibb * square(end_score_fisher_s2z_zibb) + ",
+          "square(dpmid_fisher_s2z_zibb) / ",
+          "fmax(pmid_fisher_s2z_zibb, 1e-12);\n",
+          "        real base_info_fisher_s2z_zi = ",
+          str_if(
+            dpar == "mu",
+            glue(
+              "({trials} == 0 ? 0.0 : ({trials} == 1 ? ",
+              "({binary_information(ref('mu'))}) : ",
+              "coarse_info_fisher_s2z_zibb));\n"
+            ),
+            glue(
+              "({trials} <= 1 ? 0.0 : ",
+              "coarse_info_fisher_s2z_zibb);\n"
+            )
+          )
+        ))
+      }
+    } else {
+      mu <- ref("mu")$value
+      dmu <- ref("mu")$derivative
+      shape <- ref("shape")$value
+      dshape <- ref("shape")$derivative
+      definitions <- c(definitions, glue(
+        "        real mean_fraction_fisher_s2z_zinb = ",
+        "({mu}) / (({mu}) + ({shape}));\n",
+        "        real log_p0_fisher_s2z_zi = -({shape}) * ",
+        "log1p(({mu}) / ({shape}));\n",
+        "        real p0_fisher_s2z_zi = exp(log_p0_fisher_s2z_zi);\n",
+        "        real ppos_fisher_s2z_zi = ",
+        "-expm1(log_p0_fisher_s2z_zi);\n",
+        "        real q0_fisher_s2z_zi = ({zi}) + ",
+        "(1.0 - ({zi})) * p0_fisher_s2z_zi;\n",
+        "        real qpos_fisher_s2z_zi = ",
+        "(1.0 - ({zi})) * ppos_fisher_s2z_zi;\n"
+      ))
+      if (dpar == "mu") {
+        nb_mean_info <- if (identical(ref("mu")$link, "log")) {
+          glue("({mu}) * ({shape}) / (({mu}) + ({shape}))")
+        } else {
+          glue(
+            "square({dmu}) * ({shape}) / fmax(({mu}) * ",
+            "(({mu}) + ({shape})), 1e-12)"
+          )
+        }
+        definitions <- c(definitions, glue(
+          "        real base_info_fisher_s2z_zi = {nb_mean_info};\n",
+          "        real zero_score_fisher_s2z_zi = -({dmu}) * ",
+          "({shape}) / (({mu}) + ({shape}));\n"
+        ))
+      } else if (dpar == "shape") {
+        definitions <- c(definitions, glue(
+          "        real dlog_p0_log_shape_fisher_s2z_zinb = ({shape}) * ",
+          "(-log1p(({mu}) / ({shape})) + ",
+          "mean_fraction_fisher_s2z_zinb);\n",
+          "        real sparse_info_fisher_s2z_zinb = 0.5 * ({shape}) / ",
+          "(({shape}) + 1.0) * square(mean_fraction_fisher_s2z_zinb);\n",
+          "        real dense_info_fisher_s2z_zinb = 0.5 * ",
+          "square(mean_fraction_fisher_s2z_zinb);\n",
+          "        real zero_info_fisher_s2z_zinb = p0_fisher_s2z_zi * ",
+          "square(dlog_p0_log_shape_fisher_s2z_zinb) / ",
+          "fmax(ppos_fisher_s2z_zi, 1e-12);\n",
+          "        real log_shape_info_fisher_s2z_zinb = ",
+          "sparse_info_fisher_s2z_zinb + zero_info_fisher_s2z_zinb + ",
+          "ppos_fisher_s2z_zi * (dense_info_fisher_s2z_zinb - ",
+          "sparse_info_fisher_s2z_zinb);\n",
+          "        real log_shape_chain_fisher_s2z_zinb = ",
+          "({dshape}) / ({shape});\n",
+          "        real base_info_fisher_s2z_zi = ",
+          "square(log_shape_chain_fisher_s2z_zinb) * ",
+          "log_shape_info_fisher_s2z_zinb;\n",
+          "        real zero_score_fisher_s2z_zi = ",
+          "log_shape_chain_fisher_s2z_zinb * ",
+          "dlog_p0_log_shape_fisher_s2z_zinb;\n"
+        ))
+      }
+    }
+    if (dpar == "zi") {
+      out <- glue(
+        "square(({dzi}) * ppos_fisher_s2z_zi) / ",
+        "fmax(q0_fisher_s2z_zi * qpos_fisher_s2z_zi, 1e-12)"
+      )
+    } else if (dpar %in% setdiff(valid_dpars(bframe), "zi")) {
+      definitions <- c(definitions, glue(
+        "        real positive_info_fisher_s2z_zi = fmax(0.0, ",
+        "base_info_fisher_s2z_zi - p0_fisher_s2z_zi * ",
+        "square(zero_score_fisher_s2z_zi) / ",
+        "fmax(ppos_fisher_s2z_zi, 1e-12));\n",
+        "        real atom_derivative_fisher_s2z_zi = ",
+        "(1.0 - ({zi})) * p0_fisher_s2z_zi * ",
+        "zero_score_fisher_s2z_zi;\n"
+      ))
+      out <- glue(
+        "(1.0 - ({zi})) * positive_info_fisher_s2z_zi + ",
+        "square(atom_derivative_fisher_s2z_zi) / ",
+        "fmax(q0_fisher_s2z_zi * qpos_fisher_s2z_zi, 1e-12)"
+      )
+    }
+  } else if (family %in% c(
+    "zero_inflated_beta", "zero_one_inflated_beta",
+    "zero_inflated_asym_laplace"
+  )) {
+    inflation <- if (family == "zero_one_inflated_beta") "zoi" else "zi"
+    atom <- ref(inflation)$value
+    if (dpar == inflation) {
+      out <- binary_information(ref(inflation))
+    } else if (family == "zero_one_inflated_beta" && dpar == "coi") {
+      coi <- ref("coi")$value
+      out <- glue("{atom} * ({binary_information(ref('coi'))})")
+    } else if (family %in% c("zero_inflated_beta", "zero_one_inflated_beta") &&
+               dpar %in% c("mu", "phi")) {
+      mu <- ref("mu")$value
+      dmu <- ref("mu")$derivative
+      phi <- ref("phi")$value
+      a <- glue("({mu}) * ({phi})")
+      b <- glue("(1.0 - ({mu})) * ({phi})")
+      base <- if (dpar == "mu") {
+        if (identical(ref("mu")$link, "logit")) {
+          glue(
+            "square(1.0 - ({mu})) * {scaled_trigamma(a)} + ",
+            "square({mu}) * {scaled_trigamma(b)}"
+          )
+        } else {
+          glue(
+            "square(({dmu}) / fmax({mu}, 1e-12)) * ",
+            "{scaled_trigamma(a)} + square(({dmu}) / ",
+            "fmax(1.0 - ({mu}), 1e-12)) * {scaled_trigamma(b)}"
+          )
+        }
+      } else {
+        glue(
+          "{sq_chain} * fmax(0.0, ({scaled_trigamma(a)} + ",
+          "{scaled_trigamma(b)}) * inv_square({phi}) - trigamma({phi}))"
+        )
+      }
+      out <- if (dpar == "mu") {
+        glue("(1.0 - {atom}) * ({base})")
+      } else {
+        glue("(1.0 - {atom}) * ({base})")
+      }
+    } else if (family == "zero_inflated_asym_laplace" &&
+               dpar %in% c("mu", "sigma", "quantile")) {
+      sigma <- ref("sigma")$value
+      quantile <- ref("quantile")$value
+      base <- if (dpar == "mu") {
+        glue("{quantile} * (1.0 - {quantile}) * inv_square({sigma})")
+      } else if (dpar == "sigma") {
+        glue("inv_square({sigma})")
+      } else {
+        NULL
+      }
+      out <- if (dpar == "quantile") {
+        glue("(1.0 - {atom}) * ({quantile_information(target)})")
+      } else {
+        glue("(1.0 - {atom}) * {sq_chain} * ({base})")
+      }
+    }
+  }
+  if (is.null(out)) {
+    return(NULL)
+  }
+  nlist(
+    obs_prec_at_n = out,
+    definitions_at_n = paste0(definitions, collapse = ""),
+    target, family, dpar
+  )
+}
+
+# Validate the ordinary Stan-side Fisher path and return the observation-level
+# quantities needed to construct its information matrices. A transformed-data
+# Gram fast path remains for scalar Gaussian/Student location information.
+# Other response-free expected or working-information weights are evaluated at
+# population-only references in Stan. Unsupported likelihood coordinates fail
+# during code generation instead of estimating a chart from observed outcomes.
+stan_re_s2z_fisher_info <- function(id, r, bframe, threads) {
+  stopifnot(is.reframe(r), has_rows(r))
+  effect_label <- if (all(r$s2z)) {
+    "S2Z group-level effects"
+  } else {
+    "ordinary group-level effects"
+  }
+  unsupported <- function(detail) {
+    stop2("Fisher centering for ", effect_label, " ", detail, ".")
+  }
+  if (any(nzchar(r$nlpar))) {
+    unsupported(paste0(
+      "does not yet support nonlinear predictors; the derivative of the ",
+      "response mean with respect to the latent score must be represented ",
+      "explicitly"
+    ))
+  }
+  if (any(nzchar(r$gtype)) || any(nzchar(r$type)) ||
+      any(nzchar(r$by)) || isTRUE(nzchar(r$gcall[[1]]$pw))) {
+    unsupported(paste0(
+      "currently requires an ordinary gr() block without by, pw, ",
+      "multi-membership, or special-effect structure"
+    ))
+  }
+  model_frame <- bframe
+  if (is.mvbrmsframe(bframe)) {
+    if (isTRUE(bframe$rescor)) {
+      unsupported(paste0(
+        "for predictor-local IDs in multivariate models currently requires ",
+        "set_rescor(FALSE)"
+      ))
+    }
+    responses <- unique(r$resp)
+    if (length(responses) != 1L || !responses %in% names(bframe$terms)) {
+      unsupported("requires one predictor-local response block")
+    }
+    model_frame <- bframe$terms[[responses]]
+  }
+  if (!is.brmsframe(model_frame)) {
+    unsupported("could not identify one response model")
+  }
+  bfl <- re_s2z_bframel(model_frame, r)
+  response_family <- model_frame$family$family
+  dpar <- bfl$dpar
+  if (has_rows(bfl$frame$ac)) {
+    unsupported("does not yet support residual autocorrelation structures")
+  }
+  used_adterms <- names(Filter(is.formula, bfl$adforms))
+  allowed_adterms <- c("trials", "rate", "subset", "index")
+  if (identical(response_family, "cox")) {
+    allowed_adterms <- c(allowed_adterms, "bhaz")
+  }
+  if (identical(response_family, "wiener")) {
+    allowed_adterms <- c(allowed_adterms, "dec")
+  }
+  bad_adterms <- setdiff(used_adterms, allowed_adterms)
+  if (length(bad_adterms)) {
+    unsupported(paste0(
+      "does not yet support response addition term",
+      ifelse(length(bad_adterms) == 1L, " '", "s '"),
+      paste0(bad_adterms, collapse = "', '"), "'"
+    ))
+  }
+  resp <- usc(unique(r$resp))
+  idp <- paste0(r$id, usc(combine_prefix(check_prefix(r))))
+  design <- glue("Z_{idp}_{r$cn}")
+  M <- nrow(r)
+  N <- glue("N{resp}")
+  group <- glue("J_{id}{resp}")
+  design_at_n <- paste0(design, "[n]")
+
+  fast_location_candidate <- response_family %in% c("gaussian", "student") &&
+    identical(bfl$family$link, "identity") && identical(dpar, "mu")
+  if (fast_location_candidate) {
+    sigma <- stan_sigma_transform(model_frame, threads = threads)
+    expected_sigma <- glue("sigma{resp}")
+    fast_location <-
+      identical(as.character(sigma), as.character(expected_sigma)) &&
+      !(identical(response_family, "student") &&
+        "nu" %in% names(bframe$dpars))
+  } else {
+    fast_location <- FALSE
+  }
+  if (fast_location) {
+    nu <- glue("nu{resp}")
+    obs_prec <- if (identical(response_family, "gaussian")) {
+      glue("inv_square({sigma})")
+    } else {
+      # Expected location information for Student-t(nu, mu, sigma).
+      glue("({nu} + 1.0) / ({nu} + 3.0) * inv_square({sigma})")
+    }
+    fixed_design <- TRUE
+    return(nlist(
+      M, fixed_design, N, group, design, design_at_n,
+      sigma, obs_prec, response_family, dpar
+    ))
+  }
+
+  closed <- stan_re_s2z_fisher_closed_form(model_frame, dpar = dpar)
+  if (is.null(closed)) {
+    unsupported(paste0(
+      "has no response-free expected-information rule for family '",
+      response_family, "' and distributional parameter '", dpar,
+      "'"
+    ))
+  }
+  source <- list(
+    columns = seq_len(M), N = N, group = group,
+    design_at_n = design_at_n,
+    obs_prec_at_n = closed$obs_prec_at_n,
+    definitions_at_n = closed$definitions_at_n
+  )
+  fixed_design <- FALSE
+  nlist(
+    M, fixed_design, sources = list(source), response_family, dpar, fun = ""
+  )
+}
+
+
+# Stan declarations for parameter-dependent marginal Fisher reliabilities.
+# Unlike fixed partial centering, these quantities are transformed parameters
+# and therefore must remain in the autodiff graph.
+stan_re_s2z_fisher_def <- function(out, id) {
+  str_add(out$tpar_def) <- glue(
+    "  // marginal Fisher centering fractions in physical coefficient axes\n",
+    "  matrix<lower=0,upper=1>[N_{id}, M_{id}] rho_s2z_{id};\n",
+    "  vector<lower=0,upper=1>[M_{id}] mean_rho_s2z_{id};\n"
+  )
+  out
+}
+
+# Ordinary group-level designs and indices are fixed data. Precompute their
+# unweighted within-level Gram matrices once so only the scalar expected
+# observation precision and covariance parameters remain in autodiff.
+stan_re_s2z_fisher_tdata <- function(out, id, r, fisher_info) {
+  stopifnot(
+    is.reframe(r), has_rows(r), isTRUE(fisher_info$fixed_design),
+    identical(fisher_info$M, nrow(r))
+  )
+  M <- fisher_info$M
+  design_at_n <- fisher_info$design_at_n
+  if (is.null(design_at_n)) {
+    design_at_n <- paste0(fisher_info$design, "[n]")
+  }
+  stopifnot(length(design_at_n) == M)
+  if (M == 1L) {
+    str_add(out$tdata_def) <- glue(
+      "  vector<lower=0>[N_{id}] exposure_fisher_s2z_{id};\n"
+    )
+    str_add(out$tdata_comp) <- glue(
+      "  exposure_fisher_s2z_{id} = zeros_vector(N_{id});\n",
+      "  for (n in 1:{fisher_info$N}) {{\n",
+      "    exposure_fisher_s2z_{id}[{fisher_info$group}[n]] += ",
+      "square({design_at_n[1]});\n",
+      "  }}\n"
+    )
+    return(out)
+  }
+
+  design_assign <- cglue(
+    "    design_fisher_s2z[{seq_len(M)}] = {design_at_n};\n"
+  )
+  str_add(out$tdata_def) <- glue(
+    "  array[N_{id}] matrix[M_{id}, M_{id}] gram_fisher_s2z_{id};\n"
+  )
+  str_add(out$tdata_comp) <- glue(
+    "  for (j in 1:N_{id}) {{\n",
+    "    gram_fisher_s2z_{id}[j] = rep_matrix(0.0, M_{id}, M_{id});\n",
+    "  }}\n",
+    "  for (n in 1:{fisher_info$N}) {{\n",
+    "    vector[M_{id}] design_fisher_s2z;\n",
+    "{design_assign}",
+    "    gram_fisher_s2z_{id}[{fisher_info$group}[n]] += ",
+    "design_fisher_s2z * design_fisher_s2z';\n",
+    "  }}\n"
+  )
+  out
+}
+
+# Compute Eq. (33) without an eigendecomposition or explicit inverse. For
+# J_j = sum_n w_F z_n z_n' and Sigma = L L', the posterior covariance is
+# V_j = L (I + L' J_j L)^-1 L'. Its marginal variance contractions are valid
+# diagonal fractions for the existing exact restricted S2Z transform.
+stan_re_s2z_fisher_comp <- function(id, r, fisher_info, L = NULL,
+                                    scale = NULL, diag_scale = NULL) {
+  fixed_design <- isTRUE(fisher_info$fixed_design)
+  sources <- fisher_info$sources
+  M <- fisher_info$M
+  stopifnot(length(M) == 1L, M >= 1L)
+  row_var_j <- "1.0"
+
+  # For one coefficient, posterior variance contraction is the scalar
+  # reliability I * tau^2 / (1 + I * tau^2). Fixed ordinary designs use the
+  # transformed-data exposure; other likelihood weights remain dynamic.
+  if (M == 1L) {
+    stopifnot(length(scale) == 1L)
+    if (fixed_design) {
+      info_def <- glue(
+        "    real obs_prec_fisher_s2z = {fisher_info$obs_prec};\n"
+      )
+      accumulation <- ""
+      information_j <- glue(
+        "obs_prec_fisher_s2z * exposure_fisher_s2z_{id}[j]"
+      )
+    } else {
+      stopifnot(length(sources) >= 1L)
+      info_def <- glue(
+        "    vector[N_{id}] info_fisher_s2z = zeros_vector(N_{id});\n"
+      )
+      accumulation <- paste0(vapply(sources, function(source) {
+        stopifnot(
+          identical(source$columns, 1L),
+          length(source$design_at_n) == 1L
+        )
+        dynamic_prec <- !is.null(source$obs_prec_at_n)
+        obs_prec <- source$obs_prec_at_n %||% source$obs_prec
+        definitions <- source$definitions_at_n %||% ""
+        glue(
+          "    {{\n",
+          str_if(
+            !dynamic_prec,
+            glue("      real obs_prec_fisher_s2z = {obs_prec};\n")
+          ),
+          "      for (n in 1:{source$N}) {{\n",
+          "{definitions}",
+          str_if(
+            dynamic_prec,
+            glue("        real obs_prec_fisher_s2z = {obs_prec};\n")
+          ),
+          "        info_fisher_s2z[{source$group}[n]] += ",
+          "obs_prec_fisher_s2z * square({source$design_at_n});\n",
+          "      }}\n",
+          "    }}\n"
+        )
+      }, character(1)), collapse = "")
+      information_j <- "info_fisher_s2z[j]"
+    }
+    return(glue(
+      "  {{\n",
+      "{info_def}",
+      "{accumulation}",
+      "    for (j in 1:N_{id}) {{\n",
+      "      real scaled_info_fisher_s2z = {row_var_j} * square({scale}) * ",
+      "{information_j};\n",
+      "      rho_s2z_{id}[j, 1] = 1.0 - ",
+      "inv(1.0 + scaled_info_fisher_s2z);\n",
+      "    }}\n",
+      "    mean_rho_s2z_{id}[1] = mean(rho_s2z_{id}[, 1]);\n",
+      "  }}\n"
+    ))
+  }
+
+  diagonal <- !is.null(diag_scale)
+  stopifnot(xor(!is.null(L), diagonal))
+
+  if (fixed_design) {
+    info_def <- glue(
+      "    real obs_prec_fisher_s2z = {fisher_info$obs_prec};\n"
+    )
+    initialization <- accumulation <- ""
+    K_j <- if (diagonal) {
+      glue(
+        "{row_var_j} * obs_prec_fisher_s2z * quad_form_diag(",
+        "gram_fisher_s2z_{id}[j], {diag_scale})"
+      )
+    } else {
+      glue(
+        "{row_var_j} * obs_prec_fisher_s2z * quad_form(",
+        "gram_fisher_s2z_{id}[j], {L})"
+      )
+    }
+  } else {
+    info_def <- glue(
+      "    array[N_{id}] matrix[M_{id}, M_{id}] info_fisher_s2z;\n"
+    )
+    initialization <- glue(
+      "    for (j in 1:N_{id}) {{\n",
+      "      info_fisher_s2z[j] = rep_matrix(0.0, M_{id}, M_{id});\n",
+      "    }}\n"
+    )
+    stopifnot(length(sources) >= 1L)
+    accumulation <- paste0(vapply(sources, function(source) {
+        stopifnot(
+          length(source$columns) == length(source$design_at_n),
+          all(source$columns >= 1L & source$columns <= M)
+        )
+        dynamic_prec <- !is.null(source$obs_prec_at_n)
+        obs_prec <- source$obs_prec_at_n %||% source$obs_prec
+        definitions <- source$definitions_at_n %||% ""
+        design_assign <- cglue(
+          "        design_fisher_s2z[{source$columns}] = ",
+          "{source$design_at_n};\n"
+        )
+        glue(
+          "    {{\n",
+          str_if(
+            !dynamic_prec,
+            glue("      real obs_prec_fisher_s2z = {obs_prec};\n")
+          ),
+          "      for (n in 1:{source$N}) {{\n",
+          "{definitions}",
+          str_if(
+            dynamic_prec,
+            glue("        real obs_prec_fisher_s2z = {obs_prec};\n")
+          ),
+          "        vector[M_{id}] design_fisher_s2z = ",
+          "zeros_vector(M_{id});\n",
+          "{design_assign}",
+          "        info_fisher_s2z[{source$group}[n]] += ",
+          "obs_prec_fisher_s2z * design_fisher_s2z * ",
+          "design_fisher_s2z';\n",
+          "      }}\n",
+          "    }}\n"
+        )
+    }, character(1)), collapse = "")
+    K_j <- if (diagonal) {
+      glue(
+        "{row_var_j} * quad_form_diag(info_fisher_s2z[j], ",
+        "{diag_scale})"
+      )
+    } else {
+      glue("{row_var_j} * quad_form(info_fisher_s2z[j], {L})")
+    }
+  }
+
+  variance_def <- if (diagonal) {
+    glue(
+      "      vector[M_{id}] unit_rhs_fisher_s2z = zeros_vector(M_{id});\n"
+    )
+  } else {
+    glue(
+      "      matrix[M_{id}, M_{id}] white_factor_fisher_s2z;\n",
+      "      row_vector[M_{id}] post_var_fisher_s2z;\n"
+    )
+  }
+  variance_comp <- if (diagonal) {
+    ""
+  } else {
+    glue(
+      "      white_factor_fisher_s2z = mdivide_left_tri_low(\n",
+      "        L_post_precision_fisher_s2z, sqrt({row_var_j}) * ({L})'\n",
+      "      );\n",
+      "      post_var_fisher_s2z = columns_dot_self(",
+      "white_factor_fisher_s2z);\n"
+    )
+  }
+  reliability_comp <- if (diagonal) {
+    glue(
+      "      for (k in 1:M_{id}) {{\n",
+      "        vector[M_{id}] unit_column_fisher_s2z;\n",
+      "        unit_rhs_fisher_s2z[k] = 1.0;\n",
+      "        unit_column_fisher_s2z = mdivide_left_tri_low(\n",
+      "          L_post_precision_fisher_s2z, unit_rhs_fisher_s2z\n",
+      "        );\n",
+      "        // The exact ratio is in [0, 1]; clamp roundoff.\n",
+      "        rho_s2z_{id}[j, k] = fmin(1.0, fmax(0.0, 1.0 -\n",
+      "          dot_self(unit_column_fisher_s2z)));\n",
+      "        unit_rhs_fisher_s2z[k] = 0.0;\n",
+      "      }}\n"
+    )
+  } else {
+    glue(
+      "      for (k in 1:M_{id}) {{\n",
+      "        // The exact ratio is in [0, 1]; clamp roundoff.\n",
+      "        rho_s2z_{id}[j, k] = fmin(1.0, fmax(0.0, 1.0 -\n",
+      "          post_var_fisher_s2z[k] / ",
+      "({row_var_j} * prior_var_fisher_s2z[k])));\n",
+      "      }}\n"
+    )
+  }
+
+  glue(
+    "  {{\n",
+    "{info_def}",
+    str_if(
+      !diagonal,
+      glue("    vector[M_{id}] prior_var_fisher_s2z = rows_dot_self({L});\n")
+    ),
+    "{initialization}",
+    "{accumulation}",
+    "    for (j in 1:N_{id}) {{\n",
+    "      matrix[M_{id}, M_{id}] K_fisher_s2z = {K_j};\n",
+    "      matrix[M_{id}, M_{id}] L_post_precision_fisher_s2z;\n",
+    "{variance_def}",
+    "      K_fisher_s2z = 0.5 * (K_fisher_s2z + K_fisher_s2z');\n",
+    "      L_post_precision_fisher_s2z = cholesky_decompose(\n",
+    "        add_diag(K_fisher_s2z, 1.0)\n",
+    "      );\n",
+    "{variance_comp}",
+    "{reliability_comp}",
+    "    }}\n",
+    "    for (k in 1:M_{id}) {{\n",
+    "      mean_rho_s2z_{id}[k] = mean(rho_s2z_{id}[, k]);\n",
+    "    }}\n",
+    "  }}\n"
+  )
+}
+
+# Precompute the column means of fixed centering fractions once. They enter
+# the restricted-transform determinant but do not depend on model parameters.
+stan_re_s2z_partial_tdata <- function(out, id) {
+  str_add(out$tdata_def) <- glue(
+    "  vector[M_{id}] mean_rho_s2z_{id};\n"
+  )
+  str_add(out$tdata_comp) <- glue(
+    "  for (k in 1:M_{id}) {{\n",
+    "    mean_rho_s2z_{id}[k] = mean(rho_s2z_{id}[, k]);\n",
+    "  }}\n"
+  )
+  out
+}
+
+# Transform orthonormal S2Z coordinates with level- and coefficient-specific
+# centering fractions.  Each local Cholesky interpolation is lower triangular
+# with a positive diagonal for rho in [0, 1].  Projecting the transformed rows
+# back onto the zero-sum subspace preserves the identifying constraint. After
+# cancellation with the physical-coordinate scale determinant, the net
+# determinant contribution is accumulated in log_det_partial_s2z_ID.
+stan_re_s2z_partial_cor_transform <- function(id) {
+  glue(
+    "  {{\n",
+    "    row_vector[M_{id}] mean_partial_s2z = ",
+    "zeros_row_vector(M_{id});\n",
+    "    log_det_partial_s2z_{id} = 0.0;\n",
+    "    for (j in 1:N_{id}) {{\n",
+    "      matrix[M_{id}, M_{id}] L_partial_s2z = ",
+    "diag_pre_multiply(rho_s2z_{id}[j]', L_Sigma_s2z_{id});\n",
+    "      for (k in 1:M_{id}) {{\n",
+    "        L_partial_s2z[k, k] += 1.0 - rho_s2z_{id}[j, k];\n",
+    "      }}\n",
+    "      r_s2z_{id}[j] = (L_Sigma_s2z_{id} * ",
+    "mdivide_left_tri_low(L_partial_s2z, r_s2z_{id}[j]'))';\n",
+    "      mean_partial_s2z += r_s2z_{id}[j];\n",
+    "      log_det_partial_s2z_{id} -= ",
+    "sum(log(diagonal(L_partial_s2z)));\n",
+    "    }}\n",
+    "    mean_partial_s2z /= N_{id};\n",
+    "    for (j in 1:N_{id}) {{\n",
+    "      r_s2z_{id}[j] -= mean_partial_s2z;\n",
+    "    }}\n",
+    "    for (k in 1:M_{id}) {{\n",
+    "      log_det_partial_s2z_{id} += log(\n",
+    "        (1.0 - mean_rho_s2z_{id}[k]) + ",
+    "mean_rho_s2z_{id}[k] * L_Sigma_s2z_{id}[k, k]\n",
+    "      );\n",
+    "    }}\n",
+    "  }}\n"
+  )
+}
+
+# Diagonal specialization of the same restricted transform.  This is used by
+# scalar and independent blocks and avoids all per-level matrix operations.
+stan_re_s2z_partial_independent_transform <- function(
+    id, k, r_s2z, scale,
+    z_s2z = glue(
+      "segment(z_s2z_{id}, ({k} - 1) * (N_{id} - 1) + 1, N_{id} - 1)"
+    )) {
+  glue(
+    "  {{\n",
+    "    vector[N_{id}] centered_partial_s2z = ",
+    "sum_to_zero_constrain_brms({z_s2z});\n",
+    "    vector[N_{id}] scale_partial_s2z = 1.0 - ",
+    "rho_s2z_{id}[, {k}] + rho_s2z_{id}[, {k}] * {scale};\n",
+    "    centered_partial_s2z = {scale} * centered_partial_s2z ./ ",
+    "scale_partial_s2z;\n",
+    "    {r_s2z} = centered_partial_s2z - mean(centered_partial_s2z);\n",
+    "    log_det_partial_s2z_{id} += -sum(log(scale_partial_s2z));\n",
+    "    log_det_partial_s2z_{id} += log(\n",
+    "      (1.0 - mean_rho_s2z_{id}[{k}]) + ",
+    "mean_rho_s2z_{id}[{k}] * {scale}\n",
+    "    );\n",
+    "  }}\n"
+  )
+}
+
 # The separated Gaussian mean/contrast law permits a Matheron update in the
 # population-coordinate dimension instead of a complete square in the sum of
 # all block dimensions. Conditional Student-t population priors remain
@@ -1001,7 +3126,7 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
 # v = sqrt(N) L^-1 m, so m = L v / sqrt(N). With orthonormal S2Z contrasts,
 # the Jacobian back to conventional group effects is |L|.
 .stan_re_s2z_explicit_block <- function(id, set, prior, normalize,
-                                        out = list()) {
+                                        out = list(), fisher_info = NULL) {
   if (is.null(out[["tpar_prior"]])) {
     out[["tpar_prior"]] <- ""
   }
@@ -1018,6 +3143,24 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
   r_s2z <- glue("r_s2z_{idp}_{r$cn}")
   is_cor <- M > 1L && isTRUE(r$cor[1])
   is_student <- identical(r$dist[1], "student")
+  s2z_mode <- re_s2z_center_mode(r)
+  s2z_center <- identical(s2z_mode, "centered")
+  s2z_fisher <- !is.null(fisher_info)
+  s2z_partial <- s2z_mode %in% c("partial", "auto")
+  stopifnot(!s2z_fisher || identical(s2z_mode, "auto"))
+
+  if (s2z_fisher) {
+    out <- stan_re_s2z_fisher_def(out, id)
+    if (isTRUE(fisher_info$fixed_design)) {
+      out <- stan_re_s2z_fisher_tdata(out, id, r, fisher_info)
+    }
+  } else if (s2z_partial) {
+    str_add(out$data) <- glue(
+      "  matrix<lower=0,upper=1>[N_{id}, M_{id}] rho_s2z_{id};",
+      "  // fixed numeric centering fractions\n"
+    )
+    out <- stan_re_s2z_partial_tdata(out, id)
+  }
 
   if (is_cor) {
     str_add(out$data) <- glue(
@@ -1036,7 +3179,13 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
 
   str_add(out$par) <- glue(
     "  vector[M_{id} * (N_{id} - 1)] z_s2z_{id};",
-    "  // physical orthonormal S2Z coordinates\n",
+    if (s2z_partial) {
+      "  // partially centered orthonormal S2Z coordinates\n"
+    } else if (s2z_center) {
+      "  // physical orthonormal S2Z coordinates\n"
+    } else {
+      "  // standardized orthonormal S2Z coordinates\n"
+    },
     "  vector[M_{id}] z_mean_s2z_{id};",
     "  // standardized omitted group mean\n"
   )
@@ -1053,28 +3202,16 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
         "  vector<lower=0>[N_{id}] group_prec_s2z_{id};\n"
       )
     ),
+    str_if(
+      s2z_partial,
+      glue("  real log_det_partial_s2z_{id};\n")
+    ),
     cglue("  vector[N_{id}] {r_s2z};\n")
   )
 
   # H is fixed by the formula and centered predictor means. Build it once in
   # transformed data so it never enters the reverse-mode expression graph.
-  str_add(out$tdata_def) <- glue(
-    "  matrix[{q}, M_{id}] H_s2z_{id};\n"
-  )
-  str_add(out$tdata_comp) <- glue(
-    "  H_s2z_{id} = rep_matrix(0.0, {q}, M_{id});\n"
-  )
-  for (j in seq_len(M)) {
-    qi <- info$match_q[j]
-    str_add(out$tdata_comp) <- glue(
-      "  H_s2z_{id}[{qi}, {j}] = 1.0;\n"
-    )
-    if (info$center && info$r$coef[j] != "Intercept") {
-      str_add(out$tdata_comp) <- glue(
-        "  H_s2z_{id}[1, {j}] = means_X{p}[{qi - 1L}];\n"
-      )
-    }
-  }
+  str_add_list(out) <- stan_re_s2z_H_code(info)
   if (is_cor) {
     str_add(out$tpar_comp) <- glue(
       "  L_Sigma_s2z_{id} = diag_pre_multiply(sd_{id}, L_{id});\n"
@@ -1084,12 +3221,50 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
       "  L_Sigma_s2z_{id} = diag_matrix(sd_{id});\n"
     )
   }
+  if (s2z_fisher) {
+    str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+      id, r = r, fisher_info = fisher_info,
+      L = if (is_cor) glue("L_Sigma_s2z_{id}") else NULL,
+      scale = if (M == 1L) glue("sd_{id}[1]") else NULL,
+      diag_scale = if (!is_cor && M > 1L) glue("sd_{id}") else NULL
+    )
+  }
+  if (is_cor || !s2z_partial) {
+    str_add(out$tpar_comp) <- glue(
+      "  for (k in 1:M_{id}) {{\n",
+      "    r_s2z_{id}[, k] = sum_to_zero_constrain_brms(",
+      "segment(z_s2z_{id}, (k - 1) * (N_{id} - 1) + 1, ",
+      "N_{id} - 1));\n",
+      "  }}\n"
+    )
+  }
+  if (s2z_partial) {
+    if (is_cor) {
+      str_add(out$tpar_comp) <- stan_re_s2z_partial_cor_transform(id)
+    } else {
+      str_add(out$tpar_comp) <- glue(
+        "  log_det_partial_s2z_{id} = 0.0;\n"
+      )
+      for (k in seq_len(M)) {
+        str_add(out$tpar_comp) <- stan_re_s2z_partial_independent_transform(
+          id, k, glue("r_s2z_{id}[, {k}]"), glue("sd_{id}[{k}]")
+        )
+      }
+    }
+  } else if (!s2z_center) {
+    if (is_cor) {
+      str_add(out$tpar_comp) <- glue(
+        "  r_s2z_{id} = r_s2z_{id} * L_Sigma_s2z_{id}';\n"
+      )
+    } else {
+      for (k in seq_len(M)) {
+        str_add(out$tpar_comp) <- glue(
+          "  r_s2z_{id}[, {k}] *= sd_{id}[{k}];\n"
+        )
+      }
+    }
+  }
   str_add(out$tpar_comp) <- glue(
-    "  for (k in 1:M_{id}) {{\n",
-    "    r_s2z_{id}[, k] = sum_to_zero_constrain_brms(",
-    "segment(z_s2z_{id}, (k - 1) * (N_{id} - 1) + 1, ",
-    "N_{id} - 1));\n",
-    "  }}\n",
     "  mean_r_s2z_{id} = L_Sigma_s2z_{id} * z_mean_s2z_{id} / ",
     "sqrt(1.0 * N_{id});\n"
   )
@@ -1131,8 +3306,17 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
 
   str_add(out$tpar_prior) <- glue(
     "  lprior += -0.5 * group_quad_s2z_{id}\n",
-    "    - (N_{id} - 1) * ",
-    "sum(log(diagonal(L_Sigma_s2z_{id})))\n",
+    str_if(
+      s2z_center,
+      glue(
+        "    - (N_{id} - 1) * ",
+        "sum(log(diagonal(L_Sigma_s2z_{id})))\n"
+      )
+    ),
+    str_if(
+      s2z_partial,
+      glue("    + log_det_partial_s2z_{id}\n")
+    ),
     str_if(
       is_student,
       glue("    - M_{id} * sum(log(group_scale_s2z_{id}))\n")
@@ -1259,14 +3443,15 @@ stan_re_s2z_prior_target <- function(spec, par, normalize) {
 }
 
 .stan_re_s2z_explicit <- function(id, bframe, prior, normalize,
-                                   out = list()) {
+                                  out = list(), fisher_info = NULL) {
   r <- subset2(bframe$frame$re, id = id)
   bfl <- re_s2z_bframel(bframe, r)
   infos <- re_s2z_infos(bfl, prior = prior)
   stopifnot(length(infos) == 1L)
   set <- nlist(set_id = id, ids = id, bfl, infos)
   out <- .stan_re_s2z_explicit_block(
-    id, set = set, prior = prior, normalize = normalize, out = out
+    id, set = set, prior = prior, normalize = normalize, out = out,
+    fisher_info = fisher_info
   )
   .stan_re_s2z_explicit_system(set, normalize = normalize, out = out)
 }
@@ -1322,14 +3507,16 @@ stan_re_s2z_H_code <- function(info) {
 # coordinates. Population-level priors and mean recovery are handled once by
 # .stan_re_s2z_joint().
 .stan_re_s2z_joint_block <- function(id, set, bframe, prior, threads,
-                                     normalize, out = list()) {
+                                     normalize, out = list(),
+                                     fisher_info = NULL) {
   lpdf <- stan_lpdf_name(normalize)
   if (is.null(out[["tpar_prior"]])) {
     out[["tpar_prior"]] <- ""
   }
   if (.stan_re_s2z_uses_explicit_mean(set)) {
     return(.stan_re_s2z_explicit_block(
-      id, set = set, prior = prior, normalize = normalize, out = out
+      id, set = set, prior = prior, normalize = normalize, out = out,
+      fisher_info = fisher_info
     ))
   }
   r <- subset2(bframe$frame$re, id = id)
@@ -1345,6 +3532,24 @@ stan_re_s2z_H_code <- function(info) {
   is_cor <- M > 1L && isTRUE(r$cor[1])
   is_student <- identical(r$dist[1], "student")
   use_matheron <- .stan_re_s2z_joint_uses_matheron(set)
+  s2z_mode <- re_s2z_center_mode(r)
+  s2z_center <- identical(s2z_mode, "centered")
+  s2z_fisher <- !is.null(fisher_info)
+  s2z_partial <- s2z_mode %in% c("partial", "auto")
+  stopifnot(!s2z_fisher || identical(s2z_mode, "auto"))
+
+  if (s2z_fisher) {
+    out <- stan_re_s2z_fisher_def(out, id)
+    if (isTRUE(fisher_info$fixed_design)) {
+      out <- stan_re_s2z_fisher_tdata(out, id, r, fisher_info)
+    }
+  } else if (s2z_partial) {
+    str_add(out$data) <- glue(
+      "  matrix<lower=0,upper=1>[N_{id}, M_{id}] rho_s2z_{id};",
+      "  // fixed numeric centering fractions\n"
+    )
+    out <- stan_re_s2z_partial_tdata(out, id)
+  }
   if (is_cor) {
     str_add(out$data) <- glue(
       "  int<lower=1> NC_{id};  // number of group-level correlations\n"
@@ -1362,7 +3567,13 @@ stan_re_s2z_H_code <- function(info) {
 
   str_add(out$par) <- glue(
     "  vector[M_{id} * (N_{id} - 1)] z_s2z_{id};",
-    "  // physical orthonormal S2Z coordinates\n"
+    if (s2z_partial) {
+      "  // partially centered orthonormal S2Z coordinates\n"
+    } else if (s2z_center) {
+      "  // physical orthonormal S2Z coordinates\n"
+    } else {
+      "  // standardized orthonormal S2Z coordinates\n"
+    }
   )
 
   str_add(out$tpar_def) <- glue(
@@ -1378,6 +3589,7 @@ stan_re_s2z_H_code <- function(info) {
       )
     ),
     "  real<lower=0> group_quad_s2z_{id};\n",
+    str_if(s2z_partial, glue("  real log_det_partial_s2z_{id};\n")),
     str_if(
       is_student,
       glue(
@@ -1413,15 +3625,63 @@ stan_re_s2z_H_code <- function(info) {
     )
   }
 
-  str_add(out$tpar_comp) <- glue(
-    "  for (k in 1:M_{id}) {{\n",
-    "    r_s2z_{id}[, k] = sum_to_zero_constrain_brms(",
-    "segment(z_s2z_{id}, (k - 1) * (N_{id} - 1) + 1, ",
-    "N_{id} - 1));\n",
-    "  }}\n"
-  )
+  if (s2z_fisher) {
+    str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+      id, r = r, fisher_info = fisher_info,
+      L = if (is_cor) glue("L_Sigma_s2z_{id}") else NULL,
+      scale = if (M == 1L) glue("sd_{id}[1]") else NULL,
+      diag_scale = if (!is_cor && M > 1L) glue("sd_{id}") else NULL
+    )
+  }
 
-  if (use_matheron && is_cor) {
+  if (s2z_partial && is_cor) {
+    partial_transform <- stan_re_s2z_partial_cor_transform(id)
+    str_add(out$tpar_comp) <- glue(
+      "  for (k in 1:M_{id}) {{\n",
+      "    r_s2z_{id}[, k] = sum_to_zero_constrain_brms(",
+      "segment(z_s2z_{id}, (k - 1) * (N_{id} - 1) + 1, ",
+      "N_{id} - 1));\n",
+      "  }}\n",
+      "{partial_transform}"
+    )
+  } else if (s2z_partial) {
+    str_add(out$tpar_comp) <- glue(
+      "  log_det_partial_s2z_{id} = 0.0;\n"
+    )
+    for (j in seq_len(M)) {
+      str_add(out$tpar_comp) <- stan_re_s2z_partial_independent_transform(
+        id, j, glue("r_s2z_{id}[, {j}]"), glue("sd_{id}[{j}]")
+      )
+    }
+  } else {
+    str_add(out$tpar_comp) <- glue(
+      "  for (k in 1:M_{id}) {{\n",
+      "    r_s2z_{id}[, k] = sum_to_zero_constrain_brms(",
+      "segment(z_s2z_{id}, (k - 1) * (N_{id} - 1) + 1, ",
+      "N_{id} - 1));\n",
+      "  }}\n"
+    )
+    if (!s2z_center) {
+      if (is_cor) {
+        str_add(out$tpar_comp) <- glue(
+          "  r_s2z_{id} = r_s2z_{id} * L_Sigma_s2z_{id}';\n"
+        )
+      } else {
+        str_add(out$tpar_comp) <- glue(
+          "  for (k in 1:M_{id}) {{\n",
+          "    r_s2z_{id}[, k] *= sd_{id}[k];\n",
+          "  }}\n"
+        )
+      }
+    }
+  }
+
+  if (use_matheron && !s2z_center && !s2z_partial) {
+    # The non-centered S2Z basis is already white in coefficient space.
+    str_add(out$tpar_comp) <- glue(
+      "  group_quad_s2z_{id} = dot_self(z_s2z_{id});\n"
+    )
+  } else if (use_matheron && is_cor) {
     str_add(out$tpar_comp) <- glue(
       "  {{\n",
       "    matrix[M_{id}, N_{id}] white_group_s2z = ",
@@ -1674,11 +3934,19 @@ stan_re_s2z_H_code <- function(info) {
     )
   }
   for (b in seq_along(infos)) {
+    r <- infos[[b]]$r
     id <- infos[[b]]$id
-    str_add(out$tpar_prior) <- glue(
-      "    - (N_{id} - 1) * ",
-      "sum(log(diagonal(L_Sigma_s2z_{id})))\n"
-    )
+    s2z_mode <- re_s2z_center_mode(r)
+    if (identical(s2z_mode, "centered")) {
+      str_add(out$tpar_prior) <- glue(
+        "    - (N_{id} - 1) * ",
+        "sum(log(diagonal(L_Sigma_s2z_{id})))\n"
+      )
+    } else if (s2z_mode %in% c("partial", "auto")) {
+      str_add(out$tpar_prior) <- glue(
+        "    + log_det_partial_s2z_{id}\n"
+      )
+    }
     if (normalize) {
       str_add(out$tpar_prior) <- glue(
         "    - 0.5 * (N_{id} - 1) * M_{id} * log(2 * pi())\n"
@@ -2019,10 +4287,17 @@ stan_re_s2z_H_code <- function(info) {
   for (b in seq_along(infos)) {
     r <- infos[[b]]$r
     id <- infos[[b]]$id
-    str_add(out$tpar_prior) <- glue(
-      "    - (N_{id} - 1) * ",
-      "sum(log(diagonal(L_Sigma_s2z_{id})))\n"
-    )
+    s2z_mode <- re_s2z_center_mode(r)
+    if (identical(s2z_mode, "centered")) {
+      str_add(out$tpar_prior) <- glue(
+        "    - (N_{id} - 1) * ",
+        "sum(log(diagonal(L_Sigma_s2z_{id})))\n"
+      )
+    } else if (s2z_mode %in% c("partial", "auto")) {
+      str_add(out$tpar_prior) <- glue(
+        "    + log_det_partial_s2z_{id}\n"
+      )
+    }
     if (identical(r$dist[1], "student")) {
       str_add(out$tpar_prior) <- glue(
         "    - M_{id} * sum(log(group_scale_s2z_{id}))\n"
@@ -2167,11 +4442,14 @@ stan_re_s2z_H_code <- function(info) {
   out
 }
 
-# Stan code for one physical sum-to-zero group-level block. The omitted common
+# Legacy Plan 02 generator for the physically centered endpoint. Keeping this
+# path byte-identical preserves compiled-code and posterior compatibility.
+# The omitted common
 # group-effect mean vector is integrated out analytically. Conditional
 # Gaussian scale mixtures are handled by a group-specific scale, which makes
 # this exact for both Gaussian and Student-t group effects.
-.stan_re_s2z <- function(id, bframe, prior, threads, normalize, out = list()) {
+.stan_re_s2z_centered_legacy <- function(id, bframe, prior, threads, normalize,
+                                          out = list()) {
   lpdf <- stan_lpdf_name(normalize)
   # Avoid partial matching of $tpar_prior to $tpar_prior_const when a group
   # scale is fixed. Otherwise the constant assignment is appended to the
@@ -2479,14 +4757,423 @@ stan_re_s2z_H_code <- function(info) {
   out
 }
 
+# Stan code for one physical sum-to-zero group-level block. The omitted common
+# group-effect mean vector is integrated out analytically. Conditional
+# Gaussian scale mixtures are handled by a group-specific scale, which makes
+# this exact for both Gaussian and Student-t group effects.
+.stan_re_s2z <- function(id, bframe, prior, threads, normalize, out = list(),
+                         fisher_info = NULL) {
+  r_center <- subset2(bframe$frame$re, id = id)
+  if (identical(re_s2z_center_mode(r_center), "centered")) {
+    return(.stan_re_s2z_centered_legacy(
+      id, bframe = bframe, prior = prior, threads = threads,
+      normalize = normalize, out = out
+    ))
+  }
+  lpdf <- stan_lpdf_name(normalize)
+  # Avoid partial matching of $tpar_prior to $tpar_prior_const when a group
+  # scale is fixed. Otherwise the constant assignment is appended to the
+  # model block when normalize = FALSE.
+  if (is.null(out[["tpar_prior"]])) {
+    out[["tpar_prior"]] <- ""
+  }
+  r <- subset2(bframe$frame$re, id = id)
+  stopifnot(is.reframe(r), has_rows(r), all(r$s2z))
+  bfl <- re_s2z_bframel(bframe, r)
+  info <- re_s2z_info(bfl, prior = prior)
+  stopifnot(!isTRUE(info$ordinal))
+  q <- length(info$qnames)
+  M <- nrow(r)
+  J <- seq_rows(r)
+  p <- info$p
+  idp <- paste0(r$id, usc(combine_prefix(check_prefix(r))))
+  is_cor <- M > 1L && isTRUE(r$cor[1])
+  is_student <- identical(r$dist[1], "student")
+  s2z_mode <- re_s2z_center_mode(r)
+  s2z_center <- identical(s2z_mode, "centered")
+  s2z_fisher <- !is.null(fisher_info)
+  s2z_partial <- s2z_mode %in% c("partial", "auto")
+  stopifnot(!s2z_fisher || identical(s2z_mode, "auto"))
+
+  single_set <- nlist(set_id = id, ids = id, bfl, infos = list(info))
+  if (.stan_re_s2z_uses_explicit_mean(single_set)) {
+    return(.stan_re_s2z_explicit(
+      id, bframe = bframe, prior = prior,
+      normalize = normalize, out = out, fisher_info = fisher_info
+    ))
+  }
+
+  if (s2z_fisher) {
+    out <- stan_re_s2z_fisher_def(out, id)
+    if (isTRUE(fisher_info$fixed_design)) {
+      out <- stan_re_s2z_fisher_tdata(out, id, r, fisher_info)
+    }
+  }
+
+  if (M == 1L) {
+    return(.stan_re_s2z_scalar(
+      id, r = r, info = info, normalize = normalize, out = out,
+      fisher_info = fisher_info
+    ))
+  }
+
+  if (!is_cor) {
+    return(.stan_re_s2z_independent(
+      id, r = r, info = info, normalize = normalize, out = out,
+      fisher_info = fisher_info
+    ))
+  }
+
+  if (s2z_partial && !s2z_fisher) {
+    str_add(out$data) <- glue(
+      "  matrix<lower=0,upper=1>[N_{id}, M_{id}] rho_s2z_{id};",
+      "  // fixed numeric centering fractions\n"
+    )
+    out <- stan_re_s2z_partial_tdata(out, id)
+  }
+
+  # Keep brms's existing covariance parameters and priors. Only the
+  # group-effect coordinates and their joint prior are replaced.
+  if (is_cor) {
+    str_add(out$data) <- glue(
+      "  int<lower=1> NC_{id};  // number of group-level correlations\n"
+    )
+    str_add_list(out) <- stan_prior(
+      prior, class = "L", group = r$group[1], suffix = usc(id),
+      type = glue("cholesky_factor_corr[M_{id}]"),
+      comment = "cholesky factor of correlation matrix",
+      normalize = normalize
+    )
+  }
+
+  str_add(out$fun) <- "  #include 'fun_sum_to_zero.stan'\n"
+  str_add(out$par) <- glue(
+    "  vector[M_{id} * (N_{id} - 1)] z_s2z_{id};",
+    if (s2z_partial) {
+      "  // partially centered orthonormal S2Z coordinates\n"
+    } else if (s2z_center) {
+      "  // physical orthonormal S2Z coordinates\n"
+    } else {
+      "  // standardized orthonormal S2Z coordinates\n"
+    }
+  )
+
+  # Independent Student-t and Cauchy population priors are represented as
+  # Gaussian scale mixtures, so the omitted group mean remains analytic.
+  for (k in seq_len(q)) {
+    spec <- info$prior[[k]]
+    if (spec$dist == "student") {
+      str_add(out$par) <- glue(
+        "  real<lower=0> udf_b_s2z{p}_{k};",
+        "  // mixing variable for population coefficient {k}\n"
+      )
+      str_add(out$tpar_prior) <- glue(
+        "  lprior += inv_chi_square_{lpdf}(udf_b_s2z{p}_{k} | ",
+        "{stan_s2z_number(spec$df)});\n"
+      )
+    }
+  }
+
+  str_add(out$tpar_def) <- glue(
+    "  // physical sum-to-zero group-level effects of ID {id}\n",
+    "  matrix[N_{id}, M_{id}] r_s2z_{id};\n",
+    "  vector[{q}] prior_mean_s2z_{id};\n",
+    "  vector<lower=0>[{q}] prior_prec_s2z_{id};\n",
+    str_if(
+      is_student,
+      glue(
+        "  vector<lower=0>[N_{id}] group_scale_s2z_{id};\n",
+        "  vector<lower=0>[N_{id}] group_prec_s2z_{id};\n"
+      )
+    ),
+    "  matrix[M_{id}, M_{id}] L_Sigma_s2z_{id};\n",
+    "  // precision of the omitted mean in L_Sigma-whitened coordinates\n",
+    "  matrix[M_{id}, M_{id}] P_s2z_{id};\n",
+    "  matrix[M_{id}, M_{id}] L_P_s2z_{id};\n",
+    str_if(
+      is_student,
+      glue("  vector[M_{id}] contrast_score_s2z_{id};\n")
+    ),
+    "  real group_quad_s2z_{id};\n",
+    str_if(
+      s2z_partial,
+      glue("  real log_det_partial_s2z_{id};\n")
+    ),
+    "  // using vectors speeds up indexing in loops\n",
+    cglue("  vector[N_{id}] r_s2z_{idp}_{r$cn};\n")
+  )
+
+  # The mapping H absorbs the omitted raw group mean into brms's population
+  # coordinates. For centered predictors its first row contains the actual
+  # means of every matching raw design column, including interactions. It is
+  # fixed by the data and belongs outside the autodiff graph.
+  str_add(out$tdata_def) <- glue(
+    "  matrix[{q}, M_{id}] H_s2z_{id};\n"
+  )
+  str_add(out$tdata_comp) <- glue(
+    "  H_s2z_{id} = rep_matrix(0.0, {q}, M_{id});\n"
+  )
+  for (j in seq_len(M)) {
+    qi <- info$match_q[j]
+    str_add(out$tdata_comp) <- glue(
+      "  H_s2z_{id}[{qi}, {j}] = 1.0;\n"
+    )
+    if (info$center && info$r$coef[j] != "Intercept") {
+      str_add(out$tdata_comp) <- glue(
+        "  H_s2z_{id}[1, {j}] = means_X{p}[{qi - 1L}];\n"
+      )
+    }
+  }
+  if (is_cor) {
+    str_add(out$tpar_comp) <- glue(
+      "  L_Sigma_s2z_{id} = diag_pre_multiply(sd_{id}, L_{id});\n"
+    )
+  } else {
+    str_add(out$tpar_comp) <- glue(
+      "  L_Sigma_s2z_{id} = diag_matrix(sd_{id});\n"
+    )
+  }
+  if (s2z_fisher) {
+    str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+      id, r = r, fisher_info = fisher_info,
+      L = if (is_cor) glue("L_Sigma_s2z_{id}") else NULL,
+      scale = if (M == 1L) glue("sd_{id}[1]") else NULL,
+      diag_scale = if (!is_cor && M > 1L) glue("sd_{id}") else NULL
+    )
+  }
+  partial_transform <- if (s2z_partial) {
+    stan_re_s2z_partial_cor_transform(id)
+  } else {
+    str_if(
+      !s2z_center,
+      glue("  r_s2z_{id} = r_s2z_{id} * L_Sigma_s2z_{id}';\n")
+    )
+  }
+  str_add(out$tpar_comp) <- glue(
+    "  for (k in 1:M_{id}) {{\n",
+    "    r_s2z_{id}[, k] = sum_to_zero_constrain_brms(",
+    "segment(z_s2z_{id}, (k - 1) * (N_{id} - 1) + 1, ",
+    "N_{id} - 1));\n",
+    "  }}\n",
+    "{partial_transform}"
+  )
+
+  for (k in seq_len(q)) {
+    spec <- info$prior[[k]]
+    loc <- stan_s2z_number(spec$location)
+    str_add(out$tpar_comp) <- glue(
+      "  prior_mean_s2z_{id}[{k}] = {loc};\n"
+    )
+    if (spec$dist == "flat") {
+      prec <- "0.0"
+    } else if (spec$dist == "normal") {
+      prec <- glue("inv_square({stan_s2z_number(spec$scale)})")
+    } else {
+      prec <- glue(
+        "inv_square({stan_s2z_number(spec$scale)} * sqrt(",
+        "{stan_s2z_number(spec$df)} * udf_b_s2z{p}_{k}))"
+      )
+    }
+    str_add(out$tpar_comp) <- glue(
+      "  prior_prec_s2z_{id}[{k}] = {prec};\n"
+    )
+  }
+
+  if (is_student) {
+    tr <- subset_reframe_dist(r, "student")
+    g <- usc(tr$ggn[1])
+    str_add(out$tpar_comp) <- glue(
+      "  group_scale_s2z_{id} = dfm{g};\n",
+      "  group_prec_s2z_{id} = inv_square(group_scale_s2z_{id});\n"
+    )
+  }
+    group_info <- str_if(
+      is_student, glue("sum(group_prec_s2z_{id})"), glue("1.0 * N_{id}")
+    )
+    contrast_score <- str_if(
+      is_student, glue(" - contrast_score_s2z_{id}")
+    )
+    contrast_score_code <- str_if(
+      is_student,
+      glue(
+        "    contrast_score_s2z_{id} = white_s2z * ",
+        "group_prec_s2z_{id};\n"
+      )
+    )
+    group_quad_code <- if (is_student) {
+      glue(
+        "    group_quad_s2z_{id} += columns_dot_self(white_s2z) * ",
+        "group_prec_s2z_{id};\n"
+      )
+    } else {
+      glue(
+        "    group_quad_s2z_{id} += dot_self(to_vector(white_s2z));\n"
+      )
+    }
+    str_add(out$tpar_comp) <- glue(
+      "  {{\n",
+      "    matrix[{q}, M_{id}] prior_factor_s2z = diag_pre_multiply(",
+      "sqrt(prior_prec_s2z_{id}), H_s2z_{id}) * L_Sigma_s2z_{id};\n",
+      "    vector[{q}] prior_difference_s2z = ",
+      "sqrt(prior_prec_s2z_{id}) .* ",
+      "(theta_s2z{p} - prior_mean_s2z_{id});\n",
+      "    matrix[M_{id}, N_{id}] white_s2z = ",
+      "mdivide_left_tri_low(L_Sigma_s2z_{id}, r_s2z_{id}');\n",
+      "    vector[M_{id}] h_s2z;\n",
+      "    vector[M_{id}] whitened_h_s2z;\n",
+      "{contrast_score_code}",
+      "    P_s2z_{id} = add_diag(crossprod(prior_factor_s2z), ",
+      "{group_info});\n",
+      "    h_s2z = prior_factor_s2z' * prior_difference_s2z",
+      "{contrast_score};\n",
+      "    L_P_s2z_{id} = cholesky_decompose(P_s2z_{id});\n",
+      "    whitened_h_s2z = mdivide_left_tri_low(L_P_s2z_{id}, h_s2z);\n",
+      "    group_quad_s2z_{id} = -dot_self(whitened_h_s2z);\n",
+      "{group_quad_code}",
+      "  }}\n",
+      cglue("  r_s2z_{idp}_{r$cn} = r_s2z_{id}[, {J}];\n")
+    )
+  str_add(out$pll_args) <- cglue(
+    ", vector r_s2z_{idp}_{r$cn}"
+  )
+
+  # Score the original conditional Gaussian hierarchy at an omitted mean of
+  # zero. group_quad stores the base group quadratic minus the completed-square
+  # correction in L_Sigma-whitened coordinates. This needs one triangular solve
+  # and never forms the group covariance or precision. The final log(N) is the
+  # measure correction for the orthonormal contrast coordinates.
+  for (k in seq_len(q)) {
+    spec <- info$prior[[k]]
+    if (spec$dist == "flat") {
+      next
+    }
+    if (spec$dist == "normal") {
+      cond_scale <- stan_s2z_number(spec$scale)
+    } else {
+      cond_scale <- glue(
+        "{stan_s2z_number(spec$scale)} * sqrt(",
+        "{stan_s2z_number(spec$df)} * udf_b_s2z{p}_{k})"
+      )
+    }
+    str_add(out$tpar_prior) <- glue(
+      "  lprior += normal_{lpdf}(theta_s2z{p}[{k}] | ",
+      "{stan_s2z_number(spec$location)}, {cond_scale});\n"
+    )
+  }
+  str_add(out$tpar_prior) <- glue(
+    "  lprior += -0.5 * group_quad_s2z_{id}\n",
+    str_if(
+      s2z_center,
+      glue(
+        "    - (N_{id} - 1) * ",
+        "sum(log(diagonal(L_Sigma_s2z_{id})))\n"
+      )
+    ),
+    str_if(
+      s2z_partial,
+      glue("    + log_det_partial_s2z_{id}\n")
+    ),
+    str_if(
+      is_student,
+      glue("    - M_{id} * sum(log(group_scale_s2z_{id}))\n")
+    ),
+    "    - sum(log(diagonal(L_P_s2z_{id})))",
+    str_if(
+      normalize,
+      glue(" - 0.5 * N_{id} * M_{id} * log(2 * pi())",
+           " + 0.5 * M_{id} * log(2 * pi())",
+           " + 0.5 * M_{id} * log(1.0 * N_{id})")
+    ),
+    ";\n"
+  )
+
+  # Recover conventional super-population coefficients and deviations using
+  # one shared conditional draw of the analytically omitted group mean.
+  str_add(out$gen_def) <- glue(
+    "  vector[M_{id}] mean_r_s2z_{id};\n",
+    "  vector[{q}] q_recovered_s2z_{id};\n",
+    "  matrix[N_{id}, M_{id}] r_{id};\n"
+  )
+  if (info$center) {
+    str_add(out$gen_def) <- glue(
+      "  real Intercept{p};\n",
+      str_if(length(info$fixef), glue("  vector[Kc{p}] b{p};\n")),
+      "  real b{p}_Intercept;\n"
+    )
+  } else {
+    str_add(out$gen_def) <- glue("  vector[{q}] b{p};\n")
+  }
+  str_add(out$gen_def) <- cglue(
+    "  vector[N_{id}] r_{idp}_{r$cn};\n"
+  )
+  if (is_cor) {
+    str_add(out$gen_def) <- glue(
+      "  // compute group-level correlations\n",
+      "  corr_matrix[M_{id}] Cor_{id}",
+      " = multiply_lower_tri_self_transpose(L_{id});\n",
+      "  vector<lower=-1,upper=1>[NC_{id}] cor_{id};\n"
+    )
+  }
+
+  str_add(out$gen_comp) <- glue(
+    "  {{\n",
+    "    matrix[{q}, M_{id}] prior_factor_s2z = diag_pre_multiply(",
+    "sqrt(prior_prec_s2z_{id}), H_s2z_{id}) * L_Sigma_s2z_{id};\n",
+    "    vector[{q}] prior_difference_s2z = sqrt(prior_prec_s2z_{id}) .* ",
+    "(theta_s2z{p} - prior_mean_s2z_{id});\n",
+    "    vector[M_{id}] h_s2z = prior_factor_s2z' * ",
+    "prior_difference_s2z{contrast_score};\n",
+    "    vector[M_{id}] forward_solve_s2z = mdivide_left_tri_low(",
+    "L_P_s2z_{id}, h_s2z);\n",
+    "    vector[M_{id}] r_mean_s2z = (mdivide_right_tri_low(",
+    "forward_solve_s2z', L_P_s2z_{id}))';\n",
+    "    vector[M_{id}] z_mean_s2z;\n",
+    "    for (k in 1:M_{id}) z_mean_s2z[k] = std_normal_rng();\n",
+    "    mean_r_s2z_{id} = L_Sigma_s2z_{id} * (r_mean_s2z + ",
+    "(mdivide_right_tri_low(z_mean_s2z', L_P_s2z_{id}))');\n",
+    "  }}\n",
+    "  q_recovered_s2z_{id} = theta_s2z{p} - H_s2z_{id} * mean_r_s2z_{id};\n",
+    "  r_{id} = r_s2z_{id};\n",
+    "  for (j in 1:N_{id}) r_{id}[j] += mean_r_s2z_{id}';\n"
+  )
+  if (info$center) {
+    str_add(out$gen_comp) <- glue(
+      "  Intercept{p} = q_recovered_s2z_{id}[1];\n",
+      str_if(
+        length(info$fixef),
+        glue("  b{p} = tail(q_recovered_s2z_{id}, Kc{p});\n",
+             "  b{p}_Intercept = Intercept{p} - dot_product(",
+             "means_X{p}, b{p});\n")
+      ),
+      str_if(
+        !length(info$fixef),
+        glue("  b{p}_Intercept = Intercept{p};\n")
+      )
+    )
+  } else {
+    str_add(out$gen_comp) <- glue("  b{p} = q_recovered_s2z_{id};\n")
+  }
+  str_add(out$gen_comp) <- cglue(
+    "  r_{idp}_{r$cn} = r_{id}[, {J}];\n"
+  )
+  if (is_cor) {
+    str_add(out$gen_comp) <- stan_cor_gen_comp(
+      cor = glue("cor_{id}"), ncol = glue("M_{id}")
+    )
+  }
+  out
+}
+
 # Component-wise specialization for multiple independent group-level effects.
 # The omitted means are conditionally independent except for the single
 # rank-one coupling induced by brms's centered population intercept.  A
 # diagonal-plus-rank-one solve therefore replaces all M x M factorizations.
-.stan_re_s2z_independent <- function(id, r, info, normalize, out = list()) {
+.stan_re_s2z_independent <- function(id, r, info, normalize, out = list(),
+                                     fisher_info = NULL) {
   lpdf <- stan_lpdf_name(normalize)
   stopifnot(
-    is.reframe(r), nrow(r) > 1L, !isTRUE(r$cor[1]), all(r$s2z)
+    is.reframe(r), nrow(r) > 1L, !isTRUE(r$cor[1]), all(r$s2z),
+    !isTRUE(info$ordinal)
   )
   q <- length(info$qnames)
   M <- nrow(r)
@@ -2494,13 +5181,32 @@ stan_re_s2z_H_code <- function(info) {
   p <- info$p
   idp <- paste0(r$id, usc(combine_prefix(check_prefix(r))))
   is_student <- identical(r$dist[1], "student")
+  s2z_mode <- re_s2z_center_mode(r)
+  s2z_center <- identical(s2z_mode, "centered")
+  s2z_fisher <- !is.null(fisher_info)
+  s2z_partial <- s2z_mode %in% c("partial", "auto")
+  stopifnot(!s2z_fisher || identical(s2z_mode, "auto"))
   r_s2z <- glue("r_s2z_{idp}_{r$cn}")
   r_public <- glue("r_{idp}_{r$cn}")
+
+  if (s2z_partial && !s2z_fisher) {
+    str_add(out$data) <- glue(
+      "  matrix<lower=0,upper=1>[N_{id}, M_{id}] rho_s2z_{id};",
+      "  // fixed numeric centering fractions\n"
+    )
+    out <- stan_re_s2z_partial_tdata(out, id)
+  }
 
   str_add(out$fun) <- "  #include 'fun_sum_to_zero.stan'\n"
   str_add(out$par) <- glue(
     "  vector[M_{id} * (N_{id} - 1)] z_s2z_{id};",
-    "  // physical orthonormal independent S2Z coordinates\n"
+    if (s2z_partial) {
+      "  // partially centered orthonormal independent S2Z coordinates\n"
+    } else if (s2z_center) {
+      "  // physical orthonormal independent S2Z coordinates\n"
+    } else {
+      "  // standardized orthonormal independent S2Z coordinates\n"
+    }
   )
 
   # Independent Student-t and Cauchy population priors remain conditionally
@@ -2535,10 +5241,13 @@ stan_re_s2z_H_code <- function(info) {
     "  real<lower=0> rank1_info_s2z_{id};\n",
     "  vector[M_{id}] mhat_s2z_{id};\n",
     "  vector[{q}] qhat_s2z_{id};\n",
-    "  real<lower=0> group_quad_s2z_{id};\n"
+    "  real<lower=0> group_quad_s2z_{id};\n",
+    str_if(
+      s2z_partial,
+      glue("  real log_det_partial_s2z_{id};\n")
+    )
   )
 
-  # The centered-intercept coupling is determined entirely by the design.
   str_add(out$tdata_def) <- glue(
     "  vector[M_{id}] intercept_map_s2z_{id};\n"
   )
@@ -2559,14 +5268,31 @@ stan_re_s2z_H_code <- function(info) {
     }
   }
 
-  for (j in seq_len(M)) {
-    str_add(out$tpar_comp) <- glue(
-      "  {r_s2z[j]} = sum_to_zero_constrain_brms(",
-      "segment(z_s2z_{id}, ({j} - 1) * (N_{id} - 1) + 1, ",
-      "N_{id} - 1));\n"
+  if (s2z_fisher) {
+    str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+      id, r = r, fisher_info = fisher_info,
+      diag_scale = glue("sd_{id}")
     )
   }
-
+  if (s2z_partial) {
+    str_add(out$tpar_comp) <- glue(
+      "  log_det_partial_s2z_{id} = 0.0;\n"
+    )
+  }
+  for (j in seq_len(M)) {
+    if (s2z_partial) {
+      str_add(out$tpar_comp) <- stan_re_s2z_partial_independent_transform(
+        id, j, r_s2z[j], glue("sd_{id}[{j}]")
+      )
+    } else {
+      str_add(out$tpar_comp) <- glue(
+        "  {r_s2z[j]} = sum_to_zero_constrain_brms(",
+        str_if(!s2z_center, glue("sd_{id}[{j}] * ")),
+        "segment(z_s2z_{id}, ({j} - 1) * (N_{id} - 1) + 1, ",
+        "N_{id} - 1));\n"
+      )
+    }
+  }
   for (k in seq_len(q)) {
     spec <- info$prior[[k]]
     loc <- stan_s2z_number(spec$location)
@@ -2711,7 +5437,14 @@ stan_re_s2z_H_code <- function(info) {
   }
   str_add(out$tpar_prior) <- glue(
     "  lprior += -0.5 * group_quad_s2z_{id}\n",
-    "    - (N_{id} - 1) * sum(log(sd_{id}))\n",
+    str_if(
+      s2z_center,
+      glue("    - (N_{id} - 1) * sum(log(sd_{id}))\n")
+    ),
+    str_if(
+      s2z_partial,
+      glue("    + log_det_partial_s2z_{id}\n")
+    ),
     str_if(
       is_student,
       glue("    - M_{id} * sum(log(group_scale_s2z_{id}))\n")
@@ -2812,21 +5545,43 @@ stan_re_s2z_H_code <- function(info) {
 # In addition to avoiding all 1 x 1 matrix algebra, the Gaussian branch uses
 # the exact zero sum of the orthonormal contrasts to remove a weighted dot
 # product and the group-scale vectors altogether.
-.stan_re_s2z_scalar <- function(id, r, info, normalize, out = list()) {
+.stan_re_s2z_scalar <- function(id, r, info, normalize, out = list(),
+                                fisher_info = NULL) {
   lpdf <- stan_lpdf_name(normalize)
-  stopifnot(is.reframe(r), nrow(r) == 1L, all(r$s2z))
+  stopifnot(
+    is.reframe(r), nrow(r) == 1L, all(r$s2z), !isTRUE(info$ordinal)
+  )
   q <- length(info$qnames)
   p <- info$p
   idp <- paste0(r$id, usc(combine_prefix(check_prefix(r))))
   cn <- r$cn[1]
   is_student <- identical(r$dist[1], "student")
+  s2z_mode <- re_s2z_center_mode(r)
+  s2z_center <- identical(s2z_mode, "centered")
+  s2z_fisher <- !is.null(fisher_info)
+  s2z_partial <- s2z_mode %in% c("partial", "auto")
+  stopifnot(!s2z_fisher || identical(s2z_mode, "auto"))
   r_s2z <- glue("r_s2z_{idp}_{cn}")
   r_public <- glue("r_{idp}_{cn}")
+
+  if (s2z_partial && !s2z_fisher) {
+    str_add(out$data) <- glue(
+      "  matrix<lower=0,upper=1>[N_{id}, M_{id}] rho_s2z_{id};",
+      "  // fixed numeric centering fractions\n"
+    )
+    out <- stan_re_s2z_partial_tdata(out, id)
+  }
 
   str_add(out$fun) <- "  #include 'fun_sum_to_zero.stan'\n"
   str_add(out$par) <- glue(
     "  vector[N_{id} - 1] z_s2z_{id};",
-    "  // physical orthonormal scalar S2Z coordinates\n"
+    if (s2z_partial) {
+      "  // partially centered orthonormal scalar S2Z coordinates\n"
+    } else if (s2z_center) {
+      "  // physical orthonormal scalar S2Z coordinates\n"
+    } else {
+      "  // standardized orthonormal scalar S2Z coordinates\n"
+    }
   )
 
   # Independent Student-t and Cauchy population priors remain conditionally
@@ -2861,7 +5616,11 @@ stan_re_s2z_H_code <- function(info) {
     "  real<lower=0> sqrt_D_s2z_{id};\n",
     "  real mhat_s2z_{id};\n",
     "  vector[{q}] qhat_s2z_{id};\n",
-    "  real<lower=0> group_quad_s2z_{id};\n"
+    "  real<lower=0> group_quad_s2z_{id};\n",
+    str_if(
+      s2z_partial,
+      glue("  real log_det_partial_s2z_{id};\n")
+    )
   )
 
   # H maps the omitted scalar group mean into all matching population
@@ -2879,10 +5638,26 @@ stan_re_s2z_H_code <- function(info) {
       glue("  H_s2z_{id}[1] = means_X{p}[{qi - 1L}];\n")
     )
   )
-  str_add(out$tpar_comp) <- glue(
-    "  {r_s2z} = sum_to_zero_constrain_brms(z_s2z_{id});\n"
-  )
-
+  if (s2z_fisher) {
+    str_add(out$tpar_comp) <- stan_re_s2z_fisher_comp(
+      id, r = r, fisher_info = fisher_info,
+      scale = glue("sd_{id}[1]")
+    )
+  }
+  if (s2z_partial) {
+    str_add(out$tpar_comp) <- glue(
+      "  log_det_partial_s2z_{id} = 0.0;\n"
+    )
+    str_add(out$tpar_comp) <- stan_re_s2z_partial_independent_transform(
+      id, 1, r_s2z, glue("sd_{id}[1]"), glue("z_s2z_{id}")
+    )
+  } else {
+    str_add(out$tpar_comp) <- glue(
+      "  {r_s2z} = sum_to_zero_constrain_brms(",
+      str_if(!s2z_center, glue("sd_{id}[1] * ")),
+      "z_s2z_{id});\n"
+    )
+  }
   for (k in seq_len(q)) {
     spec <- info$prior[[k]]
     loc <- stan_s2z_number(spec$location)
@@ -2975,7 +5750,14 @@ stan_re_s2z_H_code <- function(info) {
   }
   str_add(out$tpar_prior) <- glue(
     "  lprior += -0.5 * group_quad_s2z_{id}\n",
-    "    - (N_{id} - 1) * log(sd_{id}[1])\n",
+    str_if(
+      s2z_center,
+      glue("    - (N_{id} - 1) * log(sd_{id}[1])\n")
+    ),
+    str_if(
+      s2z_partial,
+      glue("    + log_det_partial_s2z_{id}\n")
+    ),
     str_if(
       is_student,
       glue("    - sum(log(group_scale_s2z_{id}))\n")
@@ -3033,6 +5815,8 @@ stan_re_s2z_H_code <- function(info) {
   }
   out
 }
+
+
 
 # Stable formatting for numeric constants inserted into generated Stan code.
 stan_s2z_number <- function(x) {

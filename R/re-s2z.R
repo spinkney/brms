@@ -6,6 +6,58 @@ has_re_s2z <- function(x) {
     "s2z" %in% names(x$frame$re) && any(x$frame$re$s2z)
 }
 
+# Return validated centering fractions for one group-effect block. Logical
+# values from reframes created before partial centering was added remain valid
+# endpoints. A missing column means the historical default: centered for S2Z
+# and non-centered for ordinary group effects.
+re_s2z_center_values <- function(r) {
+  stopifnot(is.reframe(r), has_rows(r))
+  value <- r[["s2z_center"]]
+  if (is.null(value)) {
+    return(as.numeric(r$s2z))
+  }
+  if (!is.numeric(value) && !is.logical(value)) {
+    stop2("Internal error: invalid group-effect centering fractions.")
+  }
+  value <- as.numeric(value)
+  if (length(value) != nrow(r) || anyNA(value) ||
+      any(!is.finite(value)) || any(value < 0 | value > 1)) {
+    stop2("Internal error: group-effect centering fractions must be in [0, 1].")
+  }
+  value
+}
+
+# Return the per-coefficient automatic-Fisher flags, defaulting to FALSE for
+# old reframes.
+re_s2z_center_auto <- function(r) {
+  stopifnot(is.reframe(r), has_rows(r))
+  value <- r[["s2z_center_auto"]]
+  if (is.null(value)) {
+    return(rep(FALSE, nrow(r)))
+  }
+  if (!is.logical(value) || length(value) != nrow(r) || anyNA(value)) {
+    stop2("Internal error: invalid automatic group-effect centering flags.")
+  }
+  value
+}
+
+# Classify a group-effect block without changing the legacy endpoint paths.
+re_s2z_center_mode <- function(r) {
+  rho <- re_s2z_center_values(r)
+  auto <- re_s2z_center_auto(r)
+  if (any(auto)) {
+    if (!all(auto)) {
+      stop2("All coefficients sharing a group-level ID must use ",
+            "Fisher centering if any coefficient does.")
+    }
+    return("auto")
+  }
+  if (any(rho > 0 & rho < 1) || length(unique(rho)) > 1L) {
+    return("partial")
+  }
+  if (all(rho == 1)) "centered" else "noncentered"
+}
+
 # Does the ordinary location component of a brmsterms object contain an S2Z
 # group term? Likelihood generation works from terms rather than frames, where
 # the flag still lives in the parsed gr() calls.
@@ -313,41 +365,88 @@ parse_re_s2z_prior <- function(prior, coef = "", context = NULL) {
   out
 }
 
-# Check fixed group scales before the Gaussian precision is constructed.
+# Check that an estimated shared scale retains the support required by the
+# exact centering charts.
+validate_re_s2z_scale_bounds <- function(
+    prior, class, setting = "gr(..., s2z = TRUE)"
+) {
+  stopifnot(is.brmsprior(prior), length(class) == 1L)
+  bounds <- stan_base_prior(prior, col = c("lb", "ub"))
+  lb <- bounds[["lb"]][1L]
+  ub <- bounds[["ub"]][1L]
+  numeric_bound <- function(x) {
+    suppressWarnings(as.numeric(x))
+  }
+  lb_num <- numeric_bound(lb)
+  if (!nzchar(lb) || length(lb_num) != 1L || !is.finite(lb_num) ||
+      lb_num < 0) {
+    stop2("Class '", class, "' must have a finite non-negative lower ",
+          "bound for ", setting, ".")
+  }
+  if (nzchar(ub)) {
+    ub_num <- numeric_bound(ub)
+    if (length(ub_num) != 1L || !is.finite(ub_num) || ub_num <= 0 ||
+        ub_num <= lb_num) {
+      stop2("Class '", class, "' must have a finite positive upper bound ",
+            "greater than its lower bound when one is specified for ",
+            setting, ".")
+    }
+  }
+  invisible(NULL)
+}
+
+# Check fixed shared group scales before the Gaussian precision is constructed.
 validate_re_s2z_sd_prior <- function(prior, r, bframe = NULL) {
   stopifnot(is.brmsprior(prior), is.reframe(r), has_rows(r))
+  setting <- if (all(r$s2z)) {
+    "gr(..., s2z = TRUE)"
+  } else {
+    "positive ordinary group-effect centering"
+  }
   px <- check_prefix(r)
   p <- subset2(
     prior, class = "sd", coef = c(r$coef, ""),
     group = c(r$group[1], ""), ls = px
   )
   base_prior <- stan_base_prior(p)
-  for (coef in r$coef) {
+  effective_prior <- vapply(r$coef, function(coef) {
     pcoef <- subset2(p, coef = coef)
     coef_prior <- pcoef$prior[nzchar(pcoef$prior)]
     stopifnot(length(coef_prior) <= 1L)
-    value <- if (length(coef_prior)) {
+    if (length(coef_prior)) {
       coef_prior[[1]]
     } else {
       base_prior
     }
-    if (!stan_is_constant_prior(value)) {
-      next
-    }
+  }, character(1))
+  fixed <- stan_is_constant_prior(effective_prior)
+  if (any(!fixed)) {
+    validate_re_s2z_scale_bounds(p, class = "sd", setting = setting)
+  }
+  for (i in which(fixed)) {
+    coef <- r$coef[i]
+    value <- effective_prior[i]
     call <- try(str2lang(value), silent = TRUE)
-    fixed <- if (inherits(call, "try-error") || length(call) < 2L) {
+    fixed_value <- if (inherits(call, "try-error") || length(call) < 2L) {
       NA_real_
     } else {
       suppressWarnings(as.numeric(deparse0(call[[2]])))
     }
-    if (length(fixed) != 1L || !is.finite(fixed) || fixed <= 0) {
+    if (length(fixed_value) != 1L || !is.finite(fixed_value) ||
+        fixed_value <= 0) {
       problem <- paste0(
         "Group-level standard deviations fixed with 'constant' must be ",
-        "positive numeric scalars for gr(..., s2z = TRUE) ",
+        "positive numeric scalars for ", setting, " ",
         "(coefficient '", coef, "')."
       )
       if (is.null(bframe)) {
         stop2(problem)
+      }
+      if (!all(r$s2z)) {
+        stop2(
+          problem, " Use constant(value) with a finite value greater than ",
+          "zero, or estimate the scale."
+        )
       }
       stop_re_s2z(
         re_s2z_context(bframe, r = r, coef = coef, prior = value),
@@ -501,6 +600,8 @@ re_s2z_ordinal_C <- function(r, slope_names) {
 
   out <- lapply(ids, function(id) {
     r <- subset2(re, id = id)
+    re_s2z_center_values(r)
+    re_s2z_center_auto(r)
     C <- re_s2z_ordinal_C(r, slope_names)
     match_slope <- match(r$coef, slope_names)
     match_slope[r$coef == "Intercept"] <- NA_integer_
@@ -652,6 +753,8 @@ re_s2z_ordinal_C <- function(r, slope_names) {
   center <- bframe$frame$fe$center
   out <- lapply(ids, function(id) {
     r <- subset2(re, id = id)
+    re_s2z_center_values(r)
+    re_s2z_center_auto(r)
     match_q <- match(r$coef, qnames)
     nlist(
       id, r, ordinal = FALSE, qnames,
@@ -891,6 +994,160 @@ re_s2z_info <- function(bframe, prior = NULL, id = NULL) {
   infos[[match(id, ids)]]
 }
 
+# The exact explicit-mean fallback for non-conditionally-Gaussian population
+# priors composes with every supported centering chart for predictor-local,
+# shared-scale blocks without a known grouping covariance. Later structural
+# extensions must not silently reuse its density or recovery algebra.
+validate_re_s2z_logistic_chart <- function(infos, bframe, global_bframe) {
+  stopifnot(
+    is.list(infos), is.bframel(bframe), is.anybrmsframe(global_bframe)
+  )
+  if (!length(infos) || isTRUE(infos[[1L]]$ordinal)) {
+    return(invisible(NULL))
+  }
+  specs <- infos[[1L]]$prior
+  logistic_q <- which(vapply(specs, function(spec) {
+    identical(spec$dist, "logistic")
+  }, logical(1)))
+  if (!length(logistic_q)) {
+    return(invisible(NULL))
+  }
+  all_frames <- all_bframel(global_bframe)
+  incompatible <- vapply(infos, function(info) {
+    occurrences <- sum(vapply(all_frames, function(x) {
+      r <- x$frame$re
+      has_rows(r) && info$id %in% r$id
+    }, logical(1)))
+    unshared <- "scale" %in% names(info$r) &&
+      any(info$r$scale != "shared")
+    unshared || any(nzchar(info$r$cov)) || occurrences != 1L
+  }, logical(1))
+  if (!any(incompatible)) {
+    return(invisible(NULL))
+  }
+  first <- infos[[which(incompatible)[1L]]]
+  reasons <- unique(unlist(lapply(infos[incompatible], function(info) {
+    occurrences <- sum(vapply(all_frames, function(x) {
+      r <- x$frame$re
+      has_rows(r) && info$id %in% r$id
+    }, logical(1)))
+    c(
+      if ("scale" %in% names(info$r) &&
+          any(info$r$scale != "shared")) "non-shared scales",
+      if (any(nzchar(info$r$cov))) "a known grouping covariance",
+      if (occurrences != 1L) "a cross-predictor ID"
+    )
+  }), use.names = FALSE))
+  prior_label <- unique(vapply(specs[logistic_q], function(spec) {
+    spec$prior %||% "logistic"
+  }, character(1)))
+  stop_re_s2z(
+    re_s2z_context(
+      bframe, r = first$r, coef = infos[[1L]]$qnames[logistic_q],
+      prior = paste(prior_label, collapse = ", ")
+    ),
+    "logistic_explicit_mean_chart",
+    paste0(
+      "Logistic priors on S2Z-active coordinates currently require a ",
+      "predictor-local, shared-scale group block with no known grouping ",
+      "covariance; found ", paste(reasons, collapse = ", "), "."
+    ),
+    paste0(
+      "use shared scales, no cov argument, and a predictor-local ID; ",
+      "otherwise use a normal, student_t, or cauchy prior."
+    )
+  )
+}
+
+# Validate the unrestricted centering chart for ordinary group effects. Plan 3
+# deliberately covers predictor-local ordinary gr() covariance blocks only;
+# structural combinations owned by later plans retain their established
+# non-centered implementation.
+validate_re_centered_group_effects <- function(bframe, prior) {
+  stopifnot(is.anybrmsframe(bframe), is.brmsprior(prior))
+  r_global <- bframe$frame$re
+  stopifnot(is.reframe(r_global))
+  if (!has_rows(r_global)) {
+    return(invisible(NULL))
+  }
+  requested <- !r_global$s2z &
+    (re_s2z_center_auto(r_global) | re_s2z_center_values(r_global) > 0)
+  ids <- unique(r_global$id[requested])
+  if (!length(ids)) {
+    return(invisible(NULL))
+  }
+  frames <- all_bframel(bframe)
+  for (id in ids) {
+    r <- subset2(r_global, id = id)
+    mode <- re_s2z_center_mode(r)
+    mode_label <- if (identical(mode, "auto")) "fisher" else mode
+    if (any(r$s2z)) {
+      stop2("All coefficients sharing a group-level ID must use the same ",
+            "'s2z' setting.")
+    }
+    if (length(unique(r$group)) != 1L) {
+      stop2("Centered ordinary group effects sharing an ID must use the ",
+            "same grouping factor.")
+    }
+    if (length(unique(r$dist)) != 1L ||
+        !r$dist[1L] %in% c("gaussian", "student")) {
+      distributions <- paste(unique(r$dist), collapse = ", ")
+      stop2("Center mode '", mode_label, "' is not available for ordinary ",
+            "group-effect distribution '", distributions, "'. Supported ",
+            "distributions are 'gaussian' and 'student'; use center = 0 ",
+            "for another distribution.")
+    }
+    if (length(unique(r$cor)) != 1L) {
+      stop2("Centered ordinary group effects sharing an ID must use the ",
+            "same 'cor' setting.")
+    }
+    if ("scale" %in% names(r) &&
+        (length(unique(r$scale)) != 1L || r$scale[1L] != "shared")) {
+      stop2("Centered ordinary group effects currently require shared ",
+            "group-level scales.")
+    }
+    if (any(nzchar(r$gtype), na.rm = TRUE) ||
+        any(nzchar(r$type), na.rm = TRUE)) {
+      stop2("Center mode '", mode_label,
+            "' for ordinary group effects currently ",
+            "supports ordinary gr() coefficients only; multi-membership and ",
+            "special group coefficients retain center = 0.")
+    }
+    has_pw <- any(vapply(r$gcall, function(gcall) {
+      isTRUE(nzchar(gcall$pw %||% ""))
+    }, logical(1)))
+    if (any(nzchar(r$by), na.rm = TRUE) ||
+        any(nzchar(r$cov), na.rm = TRUE) || has_pw) {
+      stop2("Center mode '", mode_label,
+            "' for ordinary group effects is not yet ",
+            "supported with 'by', 'cov', or 'pw'; use center = 0.")
+    }
+    id_frames <- Filter(function(x) {
+      rx <- x$frame$re
+      has_rows(rx) && id %in% rx$id
+    }, frames)
+    if (length(id_frames) != 1L) {
+      stop2("Centered ordinary group-level IDs must be predictor-local; ",
+            "use distinct IDs in separate response, distributional, or ",
+            "nonlinear predictors, or use center = 0.")
+    }
+    if (identical(mode, "auto")) {
+      if (re_s2z_is_ordinal_location(id_frames[[1L]])) {
+        stop2("Fisher centering is not yet supported for ordinary group ",
+              "effects in ordinal location predictors; use a fixed center ",
+              "value in [0, 1].")
+      }
+      if (any(nzchar(r$nlpar))) {
+        stop2("Fisher centering is not yet supported for ordinary group ",
+              "effects in nonlinear predictors; use a fixed center value ",
+              "in [0, 1].")
+      }
+    }
+    validate_re_s2z_sd_prior(prior, r, bframe = id_frames[[1L]])
+  }
+  invisible(NULL)
+}
+
 # Construct an S2Z design matrix in covariance-block coefficient order. A
 # block may be assembled from multiple grouping terms that share an ID.
 re_s2z_design_matrix <- function(bframe, data, id = NULL) {
@@ -972,6 +1229,7 @@ validate_re_s2z_structure <- function(bframe, data) {
   for (id in ids) {
     r <- subset2(re, id = id)
     context <- re_s2z_context(bframe, r = r)
+    mode <- re_s2z_center_mode(r)
     if (ordinal_location && any(r$type == "cs")) {
       stop_re_s2z(
         context, "ordinal_category_specific",
@@ -980,6 +1238,16 @@ validate_re_s2z_structure <- function(bframe, data) {
           "category-specific omitted-mean map."
         ),
         "use ordinary category-specific group effects with s2z = FALSE, or use a non-category-specific S2Z block."
+      )
+    }
+    if (ordinal_location && identical(mode, "auto")) {
+      stop_re_s2z(
+        context, "ordinal_fisher_centering",
+        paste0(
+          "Automatic Fisher centering is not yet supported for ordinal ",
+          "sum-to-zero location predictors."
+        ),
+        "use a fixed center value in [0, 1], or set s2z = FALSE."
       )
     }
     if (!all(r$s2z)) {
@@ -1246,6 +1514,7 @@ validate_re_s2z_design <- function(bframe, data) {
 # complete effective prior table exists.
 validate_re_s2z_prior_global <- function(bframe, prior) {
   stopifnot(is.anybrmsframe(bframe), is.brmsprior(prior))
+  validate_re_centered_group_effects(bframe, prior = prior)
   all_frames <- all_bframel(bframe)
   frames <- Filter(has_re_s2z, all_frames)
   if (!length(frames)) {
@@ -1371,7 +1640,10 @@ validate_re_s2z_prior_global <- function(bframe, prior) {
     }
     # Attaching priors performs bounds, tags, argument, and distribution
     # validation, restricted to the union of S2Z-active coordinates.
-    re_s2z_infos(x, prior = prior)
+    prior_infos <- re_s2z_infos(x, prior = prior)
+    validate_re_s2z_logistic_chart(
+      prior_infos, bframe = x, global_bframe = bframe
+    )
     for (info in infos) {
       validate_re_s2z_sd_prior(prior, info$r, bframe = x)
     }

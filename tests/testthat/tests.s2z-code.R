@@ -152,7 +152,7 @@ test_that("S2Z scalar kernel maps a centered varying interaction", {
 test_that("S2Z scalar fixed SD and unnormalized code retain the kernel", {
   form <- y ~ 1 + (1 | gr(g, s2z = TRUE))
   bprior <- prior(normal(0, 2), class = Intercept) +
-    prior(constant(1.25), class = sd)
+    prior(constant(1.25), class = sd, lb = "")
   scode <- stancode(
     form, data = s2z_dat, prior = bprior, normalize = FALSE
   )
@@ -180,6 +180,13 @@ test_that("S2Z scalar fixed SD and unnormalized code retain the kernel", {
       prior = prior(constant(0), class = sd)
     ),
     "standard deviations fixed with 'constant' must be positive"
+  )
+  expect_error(
+    stancode(
+      form, data = s2z_dat,
+      prior = prior(normal(0, 1), class = sd, lb = "")
+    ),
+    "finite non-negative lower bound"
   )
 })
 

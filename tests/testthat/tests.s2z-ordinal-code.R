@@ -8,6 +8,12 @@ s2z_ordinal_count_fixed <- function(x, pattern) {
   )))
 }
 
+s2z_ordinal_error_message <- function(expr) {
+  error <- tryCatch(expr, error = identity)
+  expect_s3_class(error, "error")
+  conditionMessage(error)
+}
+
 s2z_ordinal_dat <- local({
   n <- 24L
   data.frame(
@@ -455,4 +461,94 @@ test_that("ordinal finite coordinates stay internal by default", {
   expect_false("Intercept" %in% excluded)
   expect_false("b_Intercept" %in% excluded)
   expect_false("b" %in% excluded)
+})
+
+test_that("fixed ordinal centering charts retain the local dense system", {
+  bprior <- prior(normal(0, 1), class = Intercept) +
+    prior(normal(0, 1), class = b)
+  forms <- list(
+    noncentered = y ~ x + (1 + x | gr(
+      g, id = "ordinal-noncentered", s2z = TRUE, center = FALSE
+    )),
+    partial = y ~ x + (1 + x | gr(
+      g, id = "ordinal-partial", s2z = TRUE, center = 0.35
+    ))
+  )
+  code <- lapply(forms, function(form) {
+    stancode(
+      form, data = s2z_ordinal_dat, family = cumulative(),
+      prior = bprior, parse = TRUE
+    )
+  })
+
+  for (name in names(code)) {
+    for (term in c(
+      "// S2Z block 1 in a joint omitted-mean system",
+      "// joint omitted-mean system for S2Z blocks 1",
+      "matrix[2, 2] P_s2z_1;",
+      "L_P_s2z_1 = cholesky_decompose(P_s2z_1);",
+      "H_s2z_1[1, 1] = -1;",
+      "H_s2z_1[4, 2] = 1;",
+      "q_recovered_s2z_1 -= H_s2z_1 * mean_r_s2z_1;",
+      "ordered_logistic_lpmf(Y[n] | mu[n], finite_Intercept)"
+    )) {
+      expect_match2(code[[name]], term, info = name)
+    }
+    expect_false(
+      grepl("fast Gaussian Matheron system", code[[name]], fixed = TRUE),
+      info = name
+    )
+  }
+
+  expect_match2(
+    code$noncentered, "// standardized orthonormal S2Z coordinates"
+  )
+  expect_match2(
+    code$noncentered, "r_s2z_1 = r_s2z_1 * L_Sigma_s2z_1';"
+  )
+  expect_false(grepl("rho_s2z_1", code$noncentered, fixed = TRUE))
+  expect_false(grepl(
+    "log_det_partial_s2z_1", code$noncentered, fixed = TRUE
+  ))
+
+  for (term in c(
+    "matrix<lower=0,upper=1>[N_1, M_1] rho_s2z_1;",
+    "vector[M_1] mean_rho_s2z_1;",
+    "real log_det_partial_s2z_1;",
+    "+ log_det_partial_s2z_1"
+  )) {
+    expect_match2(code$partial, term)
+  }
+  partial_data <- standata(
+    forms$partial, data = s2z_ordinal_dat, family = cumulative()
+  )
+  expect_equal(dim(partial_data$rho_s2z_1), c(6L, 2L))
+  expect_equal(unname(partial_data$rho_s2z_1), matrix(0.35, 6L, 2L))
+})
+
+
+test_that("ordinal Fisher charts reject with local predictor context", {
+  forms <- list(
+    fisher = y ~ x + (1 + x | gr(
+      g, id = "ordinal-fisher", s2z = TRUE, center = "fisher"
+    )),
+    auto = y ~ x + (1 + x | gr(
+      g, id = "ordinal-auto", s2z = TRUE, center = "auto"
+    ))
+  )
+  for (name in names(forms)) {
+    msg <- s2z_ordinal_error_message(stancode(
+      forms[[name]], data = s2z_ordinal_dat, family = cumulative()
+    ))
+    expect_match(
+      msg, "S2Z capability 'ordinal_fisher_centering'", fixed = TRUE
+    )
+    expect_match(msg, "response 'y'", fixed = TRUE)
+    expect_match(msg, "family 'cumulative'", fixed = TRUE)
+    expect_match(msg, "dpar 'mu'", fixed = TRUE)
+    expect_match(msg, "group 'g'", fixed = TRUE)
+    expect_match(msg, paste0("ID 'ordinal-", name, "'"), fixed = TRUE)
+    expect_match(msg, "coefficient(s) 'Intercept, x'", fixed = TRUE)
+    expect_match(msg, "use a fixed center value in [0, 1]", fixed = TRUE)
+  }
 })

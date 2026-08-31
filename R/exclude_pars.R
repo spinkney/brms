@@ -140,6 +140,13 @@ exclude_pars_re <- function(bframe, save_pars, ...) {
   for (id in unique(reframe$id)) {
     c(out) <- paste0(rm_re_pars, "_", id)
     r <- subset2(reframe, id = id)
+    if (!save_pars$all && !isTRUE(r$s2z[1]) &&
+        !identical(re_s2z_center_mode(r), "noncentered")) {
+      c(out) <- paste0(c("L_center_re_", "log_jacobian_re_"), id)
+      if (identical(re_s2z_center_mode(r), "auto")) {
+        c(out) <- paste0(c("rho_s2z_", "mean_rho_s2z_"), id)
+      }
+    }
     if (!save_pars$all && isTRUE(r$s2z[1])) {
       s2z_classes <- c(
         "z_s2z", "z_mean_s2z", "r_s2z", "H_s2z",
@@ -151,13 +158,18 @@ exclude_pars_re <- function(bframe, save_pars, ...) {
         "L_Sigma_s2z", "Q_Sigma_s2z", "P_group_s2z", "h_group_s2z",
         "P_s2z", "L_P_s2z", "H_joint_s2z", "h_joint_s2z",
         "D_s2z", "sqrt_D_s2z", "D_diag_s2z", "intercept_map_s2z",
-        "rank1_info_s2z", "group_quad_s2z", "joint_quad_s2z",
+        "rank1_info_s2z", "contrast_score_s2z",
+        "group_quad_s2z", "joint_quad_s2z",
+        "log_det_partial_s2z",
         "mhat_s2z", "qhat_s2z", "white_s2z", "mean_r_s2z",
         "q_recovered_s2z"
       )
       c(out) <- paste0(s2z_classes, "_", id)
       rp <- usc(combine_prefix(r))
       c(out) <- paste0("r_s2z_", r$id, rp, "_", r$cn)
+      if (identical(re_s2z_center_mode(r), "auto")) {
+        c(out) <- paste0(c("rho_s2z_", "mean_rho_s2z_"), id)
+      }
     }
   }
   if (isFALSE(save_pars$group)) {

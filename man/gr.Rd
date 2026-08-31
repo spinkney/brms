@@ -12,7 +12,8 @@ gr(
   pw = NULL,
   cov = NULL,
   dist = "gaussian",
-  s2z = FALSE
+  s2z = FALSE,
+  center = NULL
 )
 }
 \arguments{
@@ -26,10 +27,6 @@ currently supported with \code{s2z = TRUE}.}
 
 \item{cor}{Logical. If \code{TRUE} (the default), group-level terms will be
 modelled as correlated.}
-
-\item{s2z}{Logical. If \code{TRUE}, use the experimental physical
-sum-to-zero parameterization described in the section
-\dQuote{Physical sum-to-zero effects}. The default is \code{FALSE}.}
 
 \item{id}{Optional character string. All group-level terms across the model
 with the same \code{id} will be modeled as correlated (if \code{cor} is
@@ -54,6 +51,63 @@ This argument is not currently supported with \code{s2z = TRUE}.}
 
 \item{dist}{Name of the distribution of the group-level effects. Supported
 options are \code{"gaussian"} and \code{"student"}.}
+
+\item{s2z}{Logical. If \code{TRUE}, use the experimental physical
+sum-to-zero parameterization described in the section
+\dQuote{Physical sum-to-zero effects}. The default is \code{FALSE}.}
+
+\item{center}{Logical, a single number in \code{[0, 1]}, \code{"fisher"},
+  \code{"auto"}, or \code{NULL}. For ordinary group effects,
+  \code{NULL}, \code{FALSE}, and \code{0} retain the existing non-centered
+  parameterization, while \code{TRUE} and \code{1} use centered
+  coordinates. For S2Z effects, \code{NULL}, \code{TRUE}, and \code{1}
+  use centered physical coordinates, while \code{FALSE} and \code{0} use
+  non-centered coordinates. Intermediate numbers partially center either
+  kind of group effect without changing its statistical model.
+
+  For an ordinary Gaussian group-effect vector at level \eqn{j}, let
+  \eqn{L_j} be its conditional covariance Cholesky factor and let
+  \eqn{\rho_j} contain the centering fractions. The exact map is
+  \eqn{u_j=L_j A_j^{-1}q_j}, where
+  \eqn{A_j=\mathop{diag}(\rho_j)L_j+
+  \mathop{diag}(1-\rho_j)}, with log-Jacobian
+  \eqn{\log|L_j|-\log|A_j|}. Student-t effects use the same map conditional
+  on their existing scale-mixture variable, which is included in \eqn{L_j}.
+  Correlated and independent Gaussian and Student-t \code{gr} blocks are
+  eligible. Positive centering is not currently available with \code{by},
+  \code{cov}, \code{pw}, multi-membership, or special group coefficients.
+
+  \code{center = "fisher"} chooses level- and coefficient-specific
+  fractions by combining the current Gaussian group-effect covariance with
+  response-free likelihood information computed in Stan. If \eqn{J_j} is
+  the likelihood information for grouping level \eqn{j}, \eqn{\Sigma} is
+  the current group covariance, and
+  \eqn{V_j=(\Sigma^{-1}+J_j)^{-1}}, the fraction for coefficient \eqn{k}
+  is \eqn{\rho_{jk}=1-(V_j)_{kk}/\Sigma_{kk}}. Thus \eqn{\Sigma} supplies
+  the prior metric. The rule uses the design and missingness pattern with
+  current covariance, scale, and supported likelihood parameters, but never
+  observed response values. \code{"auto"} is an alias.
+
+  Closed-form expected Fisher information is used where available. Other
+  supported native likelihood coordinates use positive analytic,
+  coarsened-outcome, or moment working information. Most observation-local
+  native families and supported categorical, simplex, hurdle,
+  zero-inflated, Cox, and Wiener coordinates are covered. Ordinal and
+  nonlinear predictors, generalized-extreme-value and custom families,
+  finite mixtures, Wiener non-decision time, residual autocorrelation, and
+  unsupported response-addition terms are excluded. Student-t group effects
+  use their Gaussian reference covariance only to choose the chart; their
+  exact target still contains every existing scale-mixture variable.
+
+  All coefficients sharing an \code{id} must select Fisher centering
+  together. For correlated blocks the fractions can depend on coefficient
+  order, although the posterior model is unchanged. Each Fisher-centered
+  ID must belong to one predictor-local \code{gr} block without structural
+  extensions; such blocks in multivariate models require
+  \code{set_rescor(FALSE)}.
+  Predictions use reconstructed conventional draws and never derive a new
+  centering chart from prediction \code{newdata}. This argument does not
+  center the population-level design matrix.}
 }
 \description{
 Function used to set up a basic grouping term in \pkg{brms}.
@@ -181,11 +235,10 @@ shorthand term so that generated category predictors receive separate
 internal IDs, or specify eligible non-reference category predictors with a
 distinct ID for each one.
 
-This implementation intentionally provides physical S2Z coordinates only;
-there is no public S2Z centering or scaling-mode argument. Centered,
-partially centered, and automatically centered modes are deferred.
-Group-level scales that vary across grouping levels and priors on realized
-level-specific scales are also deferred.
+S2Z coordinates can be centered, non-centered, partially centered, or use
+automatic Fisher centering through the \code{center} argument. Group-level
+scales that vary across grouping levels and priors on realized
+level-specific scales remain deferred.
 
 For ordinal location predictors, \code{threshold = "sum_to_zero"}, fixed or
 shared ordinal-mixture thresholds, and category-specific S2Z group effects
@@ -200,6 +253,7 @@ are unsupported. Custom Stan code must not use conventional population- or
 group-level coefficients before they are reconstructed in generated
 quantities.
 }
+
 \examples{
 \dontrun{
 # model using basic lme4-style formula
@@ -228,6 +282,18 @@ s2z_prior <- prior(exponential(2), class = "sd", group = "patient",
 fit5 <- brm(count ~ zAge * Trt +
               (1 + zAge * Trt | gr(patient, s2z = TRUE)),
             data = epilepsy, family = poisson(), prior = s2z_prior)
+
+# use standardized sum-to-zero coordinates for weakly informed effects
+form5_nc <- count ~ zAge * Trt +
+  (1 + zAge * Trt | gr(patient, s2z = TRUE, center = FALSE))
+
+# use a fixed intermediate fraction for partial centering
+form5_partial <- count ~ zAge * Trt +
+  (1 + zAge * Trt | gr(patient, s2z = TRUE, center = 0.5))
+
+# choose fractions from response-free likelihood information in Stan
+form_fisher <- y ~ x +
+  (1 + x | gr(g, s2z = TRUE, center = "fisher"))
 }
 
 }

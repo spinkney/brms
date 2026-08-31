@@ -100,22 +100,81 @@ brmsframe.btl <- function(x, data, frame = list(), basis = NULL, ...) {
   x$frame$re <- subset2(frame$re, ls = check_prefix(x))
   class(x) <- c("bframel", class(x))
   validate_re_s2z_structure(x, data = data)
-  re_s2z <- validate_re_s2z_design(x, data = data)
-  if (has_re_s2z(x)) {
-    # The affine ordinal map depends on the realized fixed and group designs.
-    # Cache the validated descriptors returned above so code generation and
-    # prediction reuse exactly the map that passed the identity check.
-    if (is.list(re_s2z) && length(re_s2z)) {
-      x$frame$re_s2z <- re_s2z
-    } else {
-      x$frame$re_s2z <- re_s2z_infos(x)
+  cached_re_s2z <- basis[["re_s2z"]]
+  reuse_re_s2z <- has_re_s2z(x) &&
+    is.list(cached_re_s2z) && length(cached_re_s2z) &&
+    identical(
+      re_s2z_basis_signature(x$frame$re),
+      lapply(cached_re_s2z, function(info) {
+        re_s2z_basis_signature(info$r)[[1L]]
+      })
+    )
+  if (reuse_re_s2z) {
+    # The affine map is part of the fitted coordinate system. In prediction
+    # frames, reuse the map validated against the fitting design rather than
+    # recentering it on newdata.
+    x$frame$re_s2z <- cached_re_s2z
+  } else {
+    re_s2z <- validate_re_s2z_design(x, data = data)
+    if (has_re_s2z(x)) {
+      # Cache the descriptors returned by the ordinal validation path. The
+      # fallback retains the existing nonordinal Plan 02 representation.
+      if (is.list(re_s2z) && length(re_s2z)) {
+        x$frame$re_s2z <- re_s2z
+      } else {
+        x$frame$re_s2z <- re_s2z_infos(x)
+      }
     }
+  }
+  if (reuse_re_s2z && !is.null(basis[["re_s2z_center"]])) {
+    # Partial-centering fractions are part of the fitted coordinate map. Reuse
+    # them for new data rather than deriving a different map at prediction time.
+    x$sdata$re_s2z_center <- basis[["re_s2z_center"]]
+  } else {
+    x$sdata$re_s2z_center <- data_re_s2z_center(x, data = data)
   }
   # these data_ functions may require the outputs of the corresponding
   # frame_ functions (but not vice versa) and are thus evaluated last
   x$sdata$gp <- data_gp(x, data, internal = TRUE)
   x$sdata$offset <- data_offset(x, data)
   x
+}
+
+# Signature of the complete predictor-local S2Z structure. Numeric group IDs
+# are intentionally included: re_formula may subset terms and renumber the
+# survivors, in which case cached maps must be rebuilt under the new IDs.
+re_s2z_basis_signature <- function(re) {
+  stopifnot(is.reframe(re))
+  if (!has_rows(re) || !any(re$s2z)) {
+    return(list())
+  }
+  ids <- unique(re$id[re$s2z])
+  lapply(ids, function(id) {
+    r <- subset2(re, id = id)
+    list(
+      id = as.character(r$id),
+      group = r$group,
+      gn = as.character(r$gn),
+      gtype = r$gtype,
+      coef = r$coef,
+      cn = as.character(r$cn),
+      resp = r$resp,
+      dpar = r$dpar,
+      nlpar = r$nlpar,
+      ggn = as.character(r$ggn),
+      cor = as.character(r$cor),
+      center = as.character(re_s2z_center_values(r)),
+      center_auto = as.character(re_s2z_center_auto(r)),
+      type = r$type,
+      by = r$by,
+      cov = r$cov,
+      dist = r$dist,
+      form = vapply(r$form, formula2str, character(1)),
+      label = vapply(r$gcall, function(gcall) {
+        gcall$label %||% ""
+      }, character(1))
+    )
+  })
 }
 
 #' @export
@@ -374,6 +433,18 @@ frame_basis.btl <- function(x, data, ...) {
   out$sp <- frame_basis_sp(x, data, ...)
   out$ac <- frame_basis_ac(x, data, ...)
   out$bhaz <- frame_basis_bhaz(x, data, ...)
+  if (is.bframel(x) && has_re_s2z(x)) {
+    re_s2z_center <- x$sdata[["re_s2z_center"]]
+    if (is.null(re_s2z_center)) {
+      re_s2z_center <- data_re_s2z_center(x, data = data)
+    }
+    if (length(re_s2z_center)) {
+      out$re_s2z_center <- re_s2z_center
+    }
+    if (is.list(x$frame$re_s2z) && length(x$frame$re_s2z)) {
+      out$re_s2z <- x$frame$re_s2z
+    }
+  }
   out
 }
 

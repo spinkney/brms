@@ -20,6 +20,58 @@
 #' @param s2z Logical. If \code{TRUE}, use the experimental physical
 #'   sum-to-zero parameterization described in the section
 #'   \dQuote{Physical sum-to-zero effects}. The default is \code{FALSE}.
+#' @param center Logical, a single number in \code{[0, 1]}, \code{"fisher"},
+#'   \code{"auto"}, or \code{NULL}. For ordinary group effects,
+#'   \code{NULL}, \code{FALSE}, and \code{0} retain the existing non-centered
+#'   parameterization, while \code{TRUE} and \code{1} use centered
+#'   coordinates. For S2Z effects, \code{NULL}, \code{TRUE}, and \code{1}
+#'   use centered physical coordinates, while \code{FALSE} and \code{0} use
+#'   non-centered coordinates. Intermediate numbers partially center either
+#'   kind of group effect without changing its statistical model.
+#'
+#'   For an ordinary Gaussian group-effect vector at level \eqn{j}, let
+#'   \eqn{L_j} be its conditional covariance Cholesky factor and let
+#'   \eqn{\rho_j} contain the centering fractions. The exact map is
+#'   \eqn{u_j=L_j A_j^{-1}q_j}, where
+#'   \eqn{A_j=\mathop{diag}(\rho_j)L_j+
+#'   \mathop{diag}(1-\rho_j)}, with log-Jacobian
+#'   \eqn{\log|L_j|-\log|A_j|}. Student-t effects use the same map conditional
+#'   on their existing scale-mixture variable, which is included in \eqn{L_j}.
+#'   Correlated and independent Gaussian and Student-t \code{gr} blocks are
+#'   eligible. Positive centering is not currently available with \code{by},
+#'   \code{cov}, \code{pw}, multi-membership, or special group coefficients.
+#'
+#'   \code{center = "fisher"} chooses level- and coefficient-specific
+#'   fractions by combining the current Gaussian group-effect covariance with
+#'   response-free likelihood information computed in Stan. If \eqn{J_j} is
+#'   the likelihood information for grouping level \eqn{j}, \eqn{\Sigma} is
+#'   the current group covariance, and
+#'   \eqn{V_j=(\Sigma^{-1}+J_j)^{-1}}, the fraction for coefficient \eqn{k}
+#'   is \eqn{\rho_{jk}=1-(V_j)_{kk}/\Sigma_{kk}}. Thus \eqn{\Sigma} supplies
+#'   the prior metric. The rule uses the design and missingness pattern with
+#'   current covariance, scale, and supported likelihood parameters, but never
+#'   observed response values. \code{"auto"} is an alias.
+#'
+#'   Closed-form expected Fisher information is used where available. Other
+#'   supported native likelihood coordinates use positive analytic,
+#'   coarsened-outcome, or moment working information. Most observation-local
+#'   native families and supported categorical, simplex, hurdle,
+#'   zero-inflated, Cox, and Wiener coordinates are covered. Ordinal and
+#'   nonlinear predictors, generalized-extreme-value and custom families,
+#'   finite mixtures, Wiener non-decision time, residual autocorrelation, and
+#'   unsupported response-addition terms are excluded. Student-t group effects
+#'   use their Gaussian reference covariance only to choose the chart; their
+#'   exact target still contains every existing scale-mixture variable.
+#'
+#'   All coefficients sharing an \code{id} must select Fisher centering
+#'   together. For correlated blocks the fractions can depend on coefficient
+#'   order, although the posterior model is unchanged. Each Fisher-centered
+#'   ID must belong to one predictor-local \code{gr} block without structural
+#'   extensions; such blocks in multivariate models require
+#'   \code{set_rescor(FALSE)}.
+#'   Predictions use reconstructed conventional draws and never derive a new
+#'   centering chart from prediction \code{newdata}. This argument does not
+#'   center the population-level design matrix.
 #' @param id Optional character string. All group-level terms across the model
 #'   with the same \code{id} will be modeled as correlated (if \code{cor} is
 #'   \code{TRUE}). With \code{s2z = TRUE}, this sharing is limited to terms in
@@ -159,11 +211,10 @@
 #' internal IDs, or specify eligible non-reference category predictors with a
 #' distinct ID for each one.
 #'
-#' This implementation intentionally provides physical S2Z coordinates only;
-#' there is no public S2Z centering or scaling-mode argument. Centered,
-#' partially centered, and automatically centered modes are deferred.
-#' Group-level scales that vary across grouping levels and priors on realized
-#' level-specific scales are also deferred.
+#' S2Z coordinates can be centered, non-centered, partially centered, or use
+#' automatic Fisher centering through the \code{center} argument. Group-level
+#' scales that vary across grouping levels and priors on realized
+#' level-specific scales remain deferred.
 #'
 #' For ordinal location predictors, \code{threshold = "sum_to_zero"}, fixed or
 #' shared ordinal-mixture thresholds, and category-specific S2Z group effects
@@ -208,11 +259,23 @@
 #' fit5 <- brm(count ~ zAge * Trt +
 #'               (1 + zAge * Trt | gr(patient, s2z = TRUE)),
 #'             data = epilepsy, family = poisson(), prior = s2z_prior)
+#'
+#' # use standardized sum-to-zero coordinates for weakly informed effects
+#' form5_nc <- count ~ zAge * Trt +
+#'   (1 + zAge * Trt | gr(patient, s2z = TRUE, center = FALSE))
+#'
+#' # use a fixed intermediate fraction for partial centering
+#' form5_partial <- count ~ zAge * Trt +
+#'   (1 + zAge * Trt | gr(patient, s2z = TRUE, center = 0.5))
+#'
+#' # choose fractions from response-free likelihood information in Stan
+#' form_fisher <- y ~ x +
+#'   (1 + x | gr(g, s2z = TRUE, center = "fisher"))
 #' }
 #'
 #' @export
 gr <- function(..., by = NULL, cor = TRUE, id = NA, pw = NULL,
-               cov = NULL, dist = "gaussian", s2z = FALSE) {
+               cov = NULL, dist = "gaussian", s2z = FALSE, center = NULL) {
   label <- deparse0(match.call())
   groups <- as.character(as.list(substitute(list(...)))[-1])
   if (length(groups) > 1L) {
@@ -221,6 +284,30 @@ gr <- function(..., by = NULL, cor = TRUE, id = NA, pw = NULL,
   stopif_illegal_group(groups[1])
   cor <- as_one_logical(cor)
   s2z <- as_one_logical(s2z)
+  s2z_center_auto <- FALSE
+  if (is.null(center)) {
+    s2z_center <- as.numeric(s2z)
+  } else if (is.character(center)) {
+    center <- as_one_character(center)
+    if (!center %in% c("fisher", "auto")) {
+      stop2("Argument 'center' must be NULL, logical, a number in [0, 1], ",
+            "\"fisher\", or \"auto\".")
+    }
+    # The numeric value is an internal placeholder. The mode flag ensures it
+    # is never used as the actual group- and coefficient-specific fraction.
+    s2z_center <- 0.5
+    s2z_center_auto <- TRUE
+  } else if (is.logical(center)) {
+    s2z_center <- as.numeric(as_one_logical(center))
+  } else if (is.numeric(center)) {
+    s2z_center <- as_one_numeric(center)
+    if (!is.finite(s2z_center) || s2z_center < 0 || s2z_center > 1) {
+      stop2("Argument 'center' must be a single number in [0, 1].")
+    }
+  } else {
+    stop2("Argument 'center' must be NULL, logical, a number in [0, 1], ",
+          "\"fisher\", or \"auto\".")
+  }
   id <- as_one_character(id, allow_na = TRUE)
   by <- substitute(by)
   if (!is.null(by)) {
@@ -247,7 +334,10 @@ gr <- function(..., by = NULL, cor = TRUE, id = NA, pw = NULL,
   byvars <- all_vars(by)
   pwvars <- all_vars(pw)
   allvars <- str2formula(c(groups, byvars, pwvars))
-  nlist(groups, allvars, label, by, cor, s2z, id, pw, cov, dist, type = "")
+  nlist(
+    groups, allvars, label, by, cor, s2z, s2z_center, s2z_center_auto,
+    id, pw, cov, dist, type = ""
+  )
 }
 
 #' Set up multi-membership grouping terms in \pkg{brms}
@@ -717,6 +807,9 @@ get_re.btl <- function(x, ...) {
 #   nlpar: name of the non-linear parameter
 #   cor: are correlations modeled for this effect?
 #   s2z: use a sum-to-zero parameterization for this effect?
+#   s2z_center: numeric centering fraction for this effect
+#   s2z_center_auto: derive centering fractions from Stan-side expected Fisher
+#     information?
 #   ggn: global number of the grouping factor
 #   type: special effects type; can be 'sp' or 'cs'
 #   gcall: output of functions 'gr' or 'mm'
@@ -763,6 +856,9 @@ frame_re <- function(bterms, data, old_levels = NULL) {
       ggn = NA,
       cor = re$cor[[i]],
       s2z = re$gcall[[i]]$s2z %||% FALSE,
+      s2z_center = re$gcall[[i]]$s2z_center %||%
+        as.numeric(re$gcall[[i]]$s2z %||% FALSE),
+      s2z_center_auto = re$gcall[[i]]$s2z_center_auto %||% FALSE,
       type = re$type[[i]],
       by = re$gcall[[i]]$by,
       cov = re$gcall[[i]]$cov,
@@ -921,7 +1017,8 @@ empty_reframe <- function() {
     id = numeric(0), group = character(0), gn = numeric(0),
     coef = character(0), cn = numeric(0), resp = character(0),
     dpar = character(0), nlpar = character(0), ggn = numeric(0),
-    cor = logical(0), s2z = logical(0), type = character(0),
+    cor = logical(0), s2z = logical(0), s2z_center = numeric(0),
+    s2z_center_auto = logical(0), type = character(0),
     form = character(0),
     stringsAsFactors = FALSE
   )
