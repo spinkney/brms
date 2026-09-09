@@ -450,6 +450,10 @@ sample_model <- function(case, parameterization) {
     args$file <- file
     args$file_refit <- file_refit
   }
+  if (identical(backend, "cmdstanr")) {
+    # Exact reconstruction checks should not be limited by CSV serialization.
+    args$sig_figs <- 18L
+  }
   do.call(brm, args)
 }
 
@@ -670,7 +674,12 @@ public_prediction_invariants <- function(fit, case, parameterization) {
   pp <- posterior_predict(fit)
   valid_prediction <- all(is.finite(pp)) &&
     all(pp %in% case$response_values)
-  threshold_ordered <- all(apply(thresholds, 1L, function(x) all(diff(x) > 0)))
+  ordered_thresholds <- brms:::has_ordered_thres(case$family)
+  threshold_support_ok <- if (ordered_thresholds) {
+    all(apply(thresholds, 1L, function(x) all(diff(x) > 0)))
+  } else {
+    all(is.finite(thresholds))
+  }
   public_names_ok <- all(
     c(sprintf("b_Intercept[%d]", seq_len(ncol(thresholds))), "b_x") %in%
       variables(fit)
@@ -685,7 +694,7 @@ public_prediction_invariants <- function(fit, case, parameterization) {
       "saved threshold and slope names use the conventional API",
       "fixef excludes internal finite ordinal coordinates",
       "public fixef and ranef reproduce posterior_linpred",
-      "ordinal thresholds are strictly ordered",
+      "ordinal thresholds satisfy the family support",
       "posterior_epred category probabilities sum to one",
       "posterior_predict returns only response categories"
     ),
@@ -693,7 +702,7 @@ public_prediction_invariants <- function(fit, case, parameterization) {
       if (public_names_ok) 0 else Inf,
       if (no_internal_fixef) 0 else Inf,
       max(abs(eta - eta_public)),
-      if (threshold_ordered) 0 else Inf,
+      if (threshold_support_ok) 0 else Inf,
       max(abs(probability_sum - 1)),
       if (valid_prediction) 0 else Inf
     ),
