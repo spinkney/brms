@@ -543,7 +543,12 @@ stan_fe <- function(bframe, prior, stanvars, threads, primitive,
     # added in the end such that the intercept comes first in out$eta
     if (s2z) {
       slice <- stan_slice(threads)
-      if (center) {
+      if (ordinal_s2z) {
+        X_s2z <- str_if(center, "Xc", "X")
+        eta_fe <- glue(
+          " + {X_s2z}{p}{slice} * tail(theta_s2z{p}, {length(fixef)})"
+        )
+      } else if (center) {
         eta_fe <- glue(
           " + Xc{p}{slice} * tail(theta_s2z{p}, {length(fixef)})"
         )
