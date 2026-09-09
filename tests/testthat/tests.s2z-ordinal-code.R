@@ -23,6 +23,38 @@ s2z_ordinal_dat <- local({
   )
 })
 
+test_that("ordinal S2Z separates slopes from thresholds in uncentered designs", {
+  dat <- transform(s2z_ordinal_dat, z = sin(seq_len(nrow(s2z_ordinal_dat))))
+  forms <- list(
+    y ~ x + (1 + x | gr(g, s2z = TRUE)),
+    y ~ x + z + (1 + x + z | gr(g, s2z = TRUE))
+  )
+  families <- list(
+    cumulative(), cumulative(threshold = "equidistant"), acat(),
+    hurdle_cumulative()
+  )
+  for (family in families) {
+    family_dat <- dat
+    if (family$family == "hurdle_cumulative") {
+      family_dat$y <- rep(0:4, length.out = nrow(dat))
+    }
+    for (center in c(TRUE, FALSE)) {
+      for (k in seq_along(forms)) {
+        form <- bf(forms[[k]], center = center)
+        code <- stancode(
+          form, data = family_dat, family = family,
+          prior = prior(normal(0, 1), class = b), parse = TRUE
+        )
+        design <- if (center) "Xc" else "X"
+        expect_match2(
+          code, sprintf("mu += %s * tail(theta_s2z, %d);", design, k)
+        )
+        expect_false(grepl("mu += X * theta_s2z;", code, fixed = TRUE))
+      }
+    }
+  }
+})
+
 test_that("flexible ordinal S2Z thresholds use finite likelihood coordinates", {
   bprior <- prior(normal(0.5, 1.5), class = Intercept) +
     prior(normal(0, 1), class = b)
