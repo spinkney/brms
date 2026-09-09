@@ -22,6 +22,13 @@ s2z_fixed_position <- function(code, pattern) {
 
 test_that("small-matrix helpers cover S2Z solves without duplicate definitions", {
   cases <- list(
+    ordinary = list(form = bf(
+      y ~ x + (1 + x | gr(g, center = 0.4)),
+      sigma ~ x + (1 + x | gr(h, center = 0.4))
+    )),
+    automatic = list(
+      form = y ~ x + (1 + x | gr(g, s2z = TRUE, center = "auto"))
+    ),
     scalar_explicit = list(
       form = y ~ 1 + (1 | gr(g, s2z = TRUE)),
       prior = prior(logistic(0, 1), class = Intercept)
@@ -53,6 +60,20 @@ test_that("small-matrix helpers cover S2Z solves without duplicate definitions",
       body
     ))
   }
+
+  # Scalar category blocks still need the small precision-inverse helper.
+  simplex_dat <- s2z_opt_dat
+  simplex_dat$response <- I(matrix(rep(c(0.2, 0.3, 0.5), each = 72L), 72L))
+  simplex_code <- stancode(
+    response ~ 1 + (1 | gr(g, s2z = TRUE, center = "auto")),
+    data = simplex_dat, family = logistic_normal()
+  )
+  expect_match2(simplex_code, "matrix chol2inv_brms(matrix L)")
+  body <- substring(
+    simplex_code, regexpr("\ndata {", simplex_code, fixed = TRUE)[1L]
+  )
+  expect_match2(body, "chol2inv_brms(Llncor)")
+  expect_false(grepl("chol2inv(", body, fixed = TRUE))
 
   # Models using only elementwise operations do not need the helper chunk.
   scalar <- stancode(y ~ 1 + (1 | gr(g, s2z = TRUE)), s2z_opt_dat)

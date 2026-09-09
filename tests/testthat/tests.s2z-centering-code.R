@@ -347,8 +347,8 @@ test_that("multivariate auto S2Z keeps target fixed and proposes in GQ", {
   expect_false(grepl("design_fisher_s2z", tpar, fixed = TRUE))
   expect_false(grepl("rho_center_candidate_1", tpar, fixed = TRUE))
   expect_match2(gq, "inv_square(sigma)")
-  expect_match2(gq, "cholesky_decompose(")
-  expect_match2(gq, "mdivide_left_tri_low(")
+  expect_match2(gq, "cholesky_decompose_brms(")
+  expect_match2(gq, "mdivide_left_tri_low_brms(")
   expect_match2(gq, "L_post_precision_fisher_s2z")
   expect_match2(gq, "white_factor_fisher_s2z")
   expect_match2(gq, "white_post_cov_fisher_s2z[j] = crossprod(")
@@ -848,7 +848,7 @@ test_that("direct independent S2Z scales K4 and K10 component-wise", {
       expect_true(grepl(term, code, fixed = TRUE), info = term)
     }
     expect_false(grepl("matrix[M_1, M_1]", code, fixed = TRUE))
-    expect_false(grepl("cholesky_decompose(", code, fixed = TRUE))
+    expect_false(grepl("cholesky_decompose_brms(", code, fixed = TRUE))
   }
 
   student_direct <- stancode(
@@ -1023,7 +1023,11 @@ test_that("Matheron supports overlapping blocks and all centering modes", {
     ),
     2L
   )
-  expect_equal(s2z_count_fixed(scode, "cholesky_decompose("), 1L)
+  expect_equal(s2z_count_fixed(
+      substring(scode, regexpr("\ndata {", scode, fixed = TRUE)[1L]),
+      "cholesky_decompose_brms("
+    ),
+    1L)
 
   selective_prior <- prior(normal(0, 2), class = Intercept) +
     prior(normal(0, 1), class = b, coef = "x:z")
