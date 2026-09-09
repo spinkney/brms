@@ -89,13 +89,16 @@ sum-to-zero parameterization described in the section
   linear predictor.
 
   \code{center = "auto"} chooses fixed level- and coefficient-specific
-  fractions through a separate precursor fit. The precursor is fully
-  non-centered and uses CmdStanR Pathfinder by default; Pathfinder runs
+  fractions through a separate precursor fit. CmdStanR Pathfinder uses
+  fully non-centered coordinates and warns if Pareto-k is at least 1 or
+  non-finite, suggesting a centered HMC precursor. Pathfinder runs
   \code{min(max(1, chains), 4)} paths unless
   \code{pilot_args$num_paths} is supplied. Alternatively,
   \code{autocenter_control(method = "hmc")} requests a separate short HMC
-  precursor. Candidate fractions are evaluated only in generated quantities
-  and aggregated across precursor draws (by the median by default). The
+  precursor in fully centered coordinates. Candidate fractions are evaluated
+  only in generated quantities
+  and aggregated across precursor draws (by the median by default, after
+  PSIS resampling for Pathfinder). The
   resulting matrix is fixed as data for a new final HMC fit with a fresh
   warmup; no centering weight changes during that fit. See
   \code{\link{autocenter_control}} and \code{\link{centering_weights}}.

@@ -305,9 +305,7 @@ re_autocenter_occurrence_weights <- function(bframe, weights, formula,
   nlist(center, id = ids, occurrence = as.integer(occurrence))
 }
 
-# Fit a fully noncentered precursor and retain only its centering proposals.
-# Pathfinder and HMC share the same contract; an HMC precursor is a separate
-# short run and never mutates the coordinates of an active warmup.
+# Validate counts used by the precursor algorithms.
 .validate_re_autocenter_integer <- function(x, name, minimum = 1L) {
   x <- as_one_numeric(x)
   if (!is.finite(x) || x != floor(x) || x < minimum ||
@@ -318,6 +316,62 @@ re_autocenter_occurrence_weights <- function(bframe, weights, formula,
   as.integer(x)
 }
 
+# Diagnose the original Pathfinder importance ratios before resampling. The
+# CmdStanR fit does not expose the PSIS diagnostic, and ratios computed after
+# resampling would no longer describe the original approximation's tails.
+.re_autocenter_pathfinder_draws <- function(draws, ndraws) {
+  reject <- function(...) {
+    stop2(
+      "The automatic-centering Pathfinder precursor ", ..., ". ",
+      "Rerun with center_control = autocenter_control(method = \"hmc\") ",
+      "to estimate centering weights from a centered HMC precursor."
+    )
+  }
+  density_names <- c("lp__", "lp_approx__")
+  if (!is.matrix(draws) || !is.numeric(draws) || !nrow(draws) ||
+      !all(density_names %in% colnames(draws))) {
+    reject("did not provide the log densities needed to check Pareto-k")
+  }
+  log_ratios <- draws[, "lp__"] - draws[, "lp_approx__"]
+  # A draw outside the target support can have log ratio -Inf and valid zero
+  # importance weight. Undefined or infinite weights cannot be diagnosed.
+  if (anyNA(log_ratios) || any(log_ratios == Inf) ||
+      !any(is.finite(log_ratios))) {
+    reject("has invalid importance ratios, so Pareto-k cannot be checked")
+  }
+  psis <- tryCatch(
+    # Use the autocenter threshold instead of loo's stricter warning threshold.
+    suppressWarnings(loo::psis(log_ratios, r_eff = 1)),
+    error = function(error) {
+      reject("could not compute Pareto-k: ", conditionMessage(error))
+    }
+  )
+  pareto_k <- as.numeric(loo::pareto_k_values(psis))
+  if (length(pareto_k) != 1L) {
+    reject("did not yield a single Pareto-k diagnostic")
+  }
+  if (!is.finite(pareto_k) || pareto_k >= 1) {
+    warning2(
+      "The automatic-centering Pathfinder precursor has Pareto-k = ",
+      format(pareto_k, digits = 4), "; centering weights may be unreliable. ",
+      "Consider rerunning with ",
+      "center_control = autocenter_control(method = \"hmc\") ",
+      "to estimate centering weights from a centered HMC precursor."
+    )
+  }
+  psis_ess <- as.numeric(loo::psis_n_eff_values(psis))
+  weights <- as.numeric(stats::weights(psis, normalize = TRUE, log = FALSE))
+  # These draws estimate posterior summaries, rather than initialize chains.
+  # Deterministic resampling retains PSIS multiplicities without using R's RNG.
+  draws <- posterior::resample_draws(
+    posterior::as_draws_matrix(draws), weights = weights,
+    method = "deterministic", ndraws = ndraws
+  )
+  nlist(draws = as.matrix(draws), pareto_k, psis_ess)
+}
+
+# Fit a noncentered Pathfinder or centered HMC precursor and retain only its
+# centering proposals. The final HMC fit always starts a separate warmup.
 run_re_autocenter_pilot <- function(model, sdata, specs, control, backend,
                                     chains, cores, threads, opencl, init,
                                     seed, silent) {
@@ -331,7 +385,9 @@ run_re_autocenter_pilot <- function(model, sdata, specs, control, backend,
   for (i in seq_along(specs)) {
     spec <- specs[[i]]
     id <- spec$id
-    pilot_data[[paste0("rho_s2z_", id)]] <- matrix(0, spec$G, spec$M)
+    pilot_data[[paste0("rho_s2z_", id)]] <- matrix(
+      as.numeric(control$method == "hmc"), spec$G, spec$M
+    )
     pilot_data[[paste0("compute_rho_center_candidate_", id)]] <- 1L
     candidates[i] <- paste0("rho_center_candidate_", id)
   }
@@ -345,19 +401,31 @@ run_re_autocenter_pilot <- function(model, sdata, specs, control, backend,
       stop2("Autocenter Pathfinder 'pilot_args' cannot contain ",
             collapse_comma(pathfinder_aliases), ".")
     }
+    if (!is.null(pilot_args$calculate_lp) &&
+        !isTRUE(pilot_args$calculate_lp)) {
+      stop2("Autocenter Pathfinder requires 'calculate_lp = TRUE' to ",
+            "check Pareto-k.")
+    }
+    if (!is.null(pilot_args$psis_resample) &&
+        !identical(pilot_args$psis_resample, FALSE)) {
+      stop2("Autocenter Pathfinder requires 'psis_resample = FALSE'; ",
+            "brms checks Pareto-k before resampling.")
+    }
+    pilot_args$calculate_lp <- TRUE
+    pilot_args$psis_resample <- FALSE
     num_paths <- pilot_args$num_paths %||% min(max(1L, chains), 4L)
     pilot_args$num_paths <- NULL
     pilot_chains <- .validate_re_autocenter_integer(
       num_paths, "pilot_args$num_paths"
     )
-    # Candidate generated quantities can be comparatively expensive.  A few
-    # hundred approximate draws are ample for the default median aggregation.
-    # CmdStan uses separate controls for one path and PSIS-combined paths;
-    # interpret a user-supplied `draws` value for both unless they explicitly
-    # distinguish `single_path_draws`.
-    pilot_args$draws <- pilot_args$draws %||% 200L
+    # A user-supplied draws count also sets the per-path default unless
+    # single_path_draws is supplied explicitly.
+    pilot_args$draws <- .validate_re_autocenter_integer(
+      pilot_args$draws %||% 1000L, "pilot_args$draws"
+    )
     pilot_args$single_path_draws <-
       pilot_args$single_path_draws %||% pilot_args$draws
+    pilot_args$max_lbfgs_iters <- pilot_args$max_lbfgs_iters %||% 2000L
   } else {
     if ("num_paths" %in% names(pilot_args)) {
       stop2("Autocenter HMC 'pilot_args' cannot contain 'num_paths'.")
@@ -442,8 +510,9 @@ run_re_autocenter_pilot <- function(model, sdata, specs, control, backend,
   if (identical(control$method, "pathfinder")) {
     c(args) <- list(
       num_paths = pilot_chains,
-      show_messages = silent < 2,
-      show_exceptions = silent == 0
+      refresh = 0L,
+      show_messages = FALSE,
+      show_exceptions = FALSE
     )
     if (threaded) {
       args$num_threads <- threads$threads
@@ -480,14 +549,27 @@ run_re_autocenter_pilot <- function(model, sdata, specs, control, backend,
             " precursor failed: ", conditionMessage(error))
     }
   )
+  variables <- candidates
+  if (identical(control$method, "pathfinder")) {
+    variables <- c(variables, "lp__", "lp_approx__")
+  }
   draws <- tryCatch(
-    pilot_fit$draws(variables = candidates, format = "matrix"),
+    pilot_fit$draws(variables = variables, format = "matrix"),
     error = function(error) {
       stop2("Could not read automatic-centering candidates from the ",
             algorithm, " precursor: ", conditionMessage(error))
     }
   )
+  pareto_k <- psis_ess <- NA_real_
+  if (identical(control$method, "pathfinder")) {
+    approximation <- .re_autocenter_pathfinder_draws(draws, pilot_args$draws)
+    draws <- approximation$draws
+    pareto_k <- approximation$pareto_k
+    psis_ess <- approximation$psis_ess
+  }
   summary <- aggregate_re_autocenter_draws(draws, control = control)
+  summary$diagnostics$pareto_k <- pareto_k
+  summary$diagnostics$psis_ess <- psis_ess
   align_re_autocenter_summary(summary, specs)
 }
 

@@ -9,12 +9,16 @@ heterogeneous fractions. The fitted fractions and fixed-to-random design map
 are stored with the model and reused by later new-data calls.
 
 `center = "auto"` estimates fixed level- and coefficient-specific fractions in
-a two-stage workflow. A fully non-centered CmdStanR precursor uses Pathfinder
-by default, or a separate short HMC run selected by `autocenter_control()`.
+a two-stage workflow. CmdStanR Pathfinder uses fully non-centered coordinates
+and warns if Pareto-k is at least 1 or non-finite, suggesting a centered HMC
+precursor via `autocenter_control(method = "hmc")`. Pathfinder defaults to
+1000 draws per path, 1000 resampled draws, and up to 2000 L-BFGS iterations
+per path, with console output disabled.
 Pathfinder runs `min(max(1, chains), 4)` paths by default, so the usual
 four-chain final fit uses four paths; `pilot_args$num_paths` overrides this.
 Candidate fractions are computed only in generated quantities and aggregated
-across precursor draws by the median by default. The final HMC fit receives
+across precursor draws by the median by default, after PSIS resampling for
+Pathfinder. The final HMC fit receives
 the frozen matrix as data and starts a fresh warmup. The former dynamic
 `center = "fisher"` spelling is no longer supported.
 
