@@ -105,12 +105,18 @@ sum-to-zero parameterization described in the section
   The former dynamic spelling \code{center = "fisher"} is not supported.
 
   Candidate fractions combine precursor draws of the group covariance with
-  likelihood information. If \eqn{J_j} is the likelihood information,
-  \eqn{\Sigma} the group covariance, and
-  \eqn{V_j=(\Sigma^{-1}+J_j)^{-1}}, the fraction for coefficient \eqn{k}
-  is \eqn{1-(V_j)_{kk}/\Sigma_{kk}}. The calculation uses the design and
-  missingness but does not inspect observed response values directly; it
-  may nevertheless be data-informed through the precursor posterior draws.
+  likelihood information evaluated at the fitted predictor. If \eqn{J_j}
+  is the likelihood information, \eqn{\Sigma} the group covariance, and
+  \eqn{V_j=(\Sigma^{-1}+J_j)^{-1}}, then \eqn{V_j} is the covariance of the
+  local second-order surrogate. For Gaussian S2Z effects, condition on the
+  zero-sum constraint: with \eqn{S=\sum_l V_l}, use
+  \eqn{V_j^c=V_j-V_jS^{-1}V_j} and the coefficient-\eqn{k} fraction
+  \eqn{1-(V_j^c)_{kk}/\{(1-1/G)\Sigma_{kk}\}}, where \eqn{G} is the
+  number of levels. Ordinary effects and Student-t S2Z effects retain the
+  local fraction \eqn{1-(V_j)_{kk}/\Sigma_{kk}}. The information calculation
+  uses the design, missingness, and fitted precursor parameters but does
+  not inspect observed response values directly; it is data-informed
+  through the precursor posterior draws.
   Closed-form expected information is used where available, with positive
   analytic, coarsened-outcome, or moment working information elsewhere.
   Automatic proposals exclude ordinal and nonlinear predictors. Each

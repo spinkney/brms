@@ -22,8 +22,10 @@ Pathfinder. The final HMC fit receives
 the frozen matrix as data and starts a fresh warmup. The former dynamic
 `center = "fisher"` spelling is no longer supported.
 
-The proposal combines precursor draws of the group covariance with the
-existing expected-information catalog. Fixed fractions support eligible
+The proposal combines precursor draws of the group covariance with expected
+information evaluated at the fitted predictor. Gaussian S2Z proposals account
+for the zero-sum constraint before measuring variance contraction. Fixed
+fractions support eligible
 ordinal, distributional, nonlinear, categorical, and multivariate
 predictor-local blocks. Automatic proposals exclude ordinal and nonlinear
 predictors; predictor-local multivariate automatic blocks require

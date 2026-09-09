@@ -285,15 +285,17 @@ test_that("scalar auto S2Z proposes rho only in generated quantities", {
   expect_match2(
     gq,
     paste0(
-      "real scaled_info_fisher_s2z = 1.0 * square(sd_1[1]) * ",
+      "real scaled_info_fisher_s2z = square(sd_1[1]) * ",
       "obs_prec_fisher_s2z * exposure_fisher_s2z_1[j];"
     )
   )
   expect_match2(
     gq,
     paste0(
-      "rho_center_candidate_1[j, 1] = ",
-      "1.0 - inv(1.0 + scaled_info_fisher_s2z);"
+      "restricted_relative_post_var_fisher_s2z = ",
+      "relative_post_var_fisher_s2z[j] - ",
+      "square(relative_post_var_fisher_s2z[j]) / ",
+      "sum_relative_post_var_fisher_s2z;"
     )
   )
   expect_false(grepl("J_1[n]", gq, fixed = TRUE))
@@ -349,12 +351,13 @@ test_that("multivariate auto S2Z keeps target fixed and proposes in GQ", {
   expect_match2(gq, "mdivide_left_tri_low(")
   expect_match2(gq, "L_post_precision_fisher_s2z")
   expect_match2(gq, "white_factor_fisher_s2z")
-  expect_match2(gq, "post_var_fisher_s2z = columns_dot_self(")
+  expect_match2(gq, "white_post_cov_fisher_s2z[j] = crossprod(")
+  expect_match2(gq, "sum_white_post_cov_fisher_s2z")
+  expect_match2(gq, "restricted_post_cov_fisher_s2z")
   expect_false(grepl("mdivide_left_spd", scode, fixed = TRUE))
   expect_equal(s2z_count_fixed(gq, "quad_form("), 1L)
   expect_false(grepl("identity_matrix(M_1)", scode, fixed = TRUE))
   expect_false(grepl("white_cov_fisher_s2z", scode, fixed = TRUE))
-  expect_false(grepl("post_cov_fisher_s2z", scode, fixed = TRUE))
   expect_match2(
     scode, "diag_pre_multiply(rho_s2z_1[j]', L_Sigma_s2z_1);"
   )
@@ -383,8 +386,8 @@ test_that("multivariate auto S2Z keeps target fixed and proposes in GQ", {
     independent_gq,
     "quad_form_diag(gram_fisher_s2z_1[j], sd_1)"
   )
-  expect_match2(independent_gq, "unit_rhs_fisher_s2z")
-  expect_match2(independent_gq, "dot_self(unit_column_fisher_s2z)")
+  expect_match2(independent_gq, "diag_matrix(rep_vector(1.0, M_1))")
+  expect_match2(independent_gq, "restricted_white_post_cov_fisher_s2z")
   expect_equal(
     s2z_count_fixed(independent_gq, "quad_form("), 0L
   )
@@ -393,9 +396,7 @@ test_that("multivariate auto S2Z keeps target fixed and proposes in GQ", {
   expect_false(grepl(
     "mdivide_left_spd", independent_code, fixed = TRUE
   ))
-  expect_false(grepl(
-    "post_cov_fisher_s2z", independent_code, fixed = TRUE
-  ))
+  expect_match2(independent_gq, "white_post_cov_fisher_s2z")
 
 })
 
@@ -454,11 +455,21 @@ test_that("response-free proposal rules cover representative likelihoods", {
       zi ~ 1 + (1 | gr(g, s2z = TRUE, center = "auto"))
     ),
     zero_inflated_poisson(),
-    c("q0_fisher_s2z_zi", "atom_derivative_fisher_s2z_zi"),
+    c(
+      "q0_fisher_s2z_zi", "atom_derivative_fisher_s2z_zi",
+      paste0(
+        "real eta_fisher_s2z_mu = (theta_s2z[1] + ",
+        "r_s2z_1_1[J_1[n]] * Z_1_1[n]);"
+      ),
+      paste0(
+        "real eta_fisher_s2z_zi = (theta_s2z_zi[1] + ",
+        "r_s2z_2_zi_1[J_2[n]] * Z_2_zi_1[n]);"
+      )
+    ),
     prior = zip_prior
   )
 
-  # Marginal category information from the population-only softmax.
+  # Marginal category information from the fitted softmax.
   check_code(
     category ~ 1 + (1 | gr(g, s2z = TRUE, center = "auto")),
     categorical(), "prob_fisher_s2z_cat"
