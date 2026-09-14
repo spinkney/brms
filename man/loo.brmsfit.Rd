@@ -83,6 +83,12 @@ on the posterior likelihood using the \pkg{loo} package.
 For more details see \code{\link[loo:loo]{loo}}.
 }
 \details{
+Post-processing defaults to one core, independently of \code{mc.cores}
+and the number of sampling chains. Pass \code{cores} explicitly to request
+parallel processing. The \pkg{loo} package uses forking for multiple cores
+on macOS and Linux, which is unavailable in the Positron Console;
+use \code{cores = 1} there.
+
 See \code{\link{loo_compare}} for details on model comparisons.
  For \code{brmsfit} objects, \code{LOO} is an alias of \code{loo}.
  Use method \code{\link{add_criterion}} to store

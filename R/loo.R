@@ -48,6 +48,11 @@
 #'  For \code{brmsfit} objects, \code{LOO} is an alias of \code{loo}.
 #'  Use method \code{\link{add_criterion}} to store
 #'  information criteria in the fitted model object for later usage.
+#'  Post-processing defaults to one core, independently of \code{mc.cores}
+#'  and the number of sampling chains. Pass \code{cores} explicitly to request
+#'  parallel processing. The \pkg{loo} package uses forking for multiple cores
+#'  on macOS and Linux, which is unavailable in the Positron Console;
+#'  use \code{cores = 1} there.
 #'
 #' @return If just one object is provided, an object of class \code{loo}.
 #'  If multiple objects are provided, an object of class \code{loolist}.
@@ -349,10 +354,14 @@ psis.brmsfit <- function(log_ratios, newdata = NULL, resp = NULL,
 }
 
 # prepare arguments passed to the methods of the `loo` package
-prepare_loo_args <- function(x, newdata, resp, pointwise, ...) {
+prepare_loo_args <- function(x, newdata, resp, pointwise, cores = NULL, ...) {
   pointwise <- as_one_logical(pointwise)
-  loo_args <- list(...)
-  ll_args <- nlist(object = x, newdata, resp, pointwise, ...)
+  # Use the same explicit core count for log_lik, relative_eff and PSIS.
+  # Otherwise loo inherits mc.cores and may fork even though brms computed
+  # the log likelihood serially (not supported by the Positron Console).
+  cores <- validate_cores_post_processing(cores)
+  loo_args <- nlist(cores, ...)
+  ll_args <- nlist(object = x, newdata, resp, pointwise, cores, ...)
   loo_args$x <- do_call(log_lik, ll_args)
   if (pointwise) {
     loo_args$draws <- attr(loo_args$x, "draws")

@@ -32,7 +32,7 @@ dat <- data.frame(x = rnorm(120))
 dat$y <- 1.2 - .7 * dat$x + rnorm(120, sd = .8)
 gaussian <- fit_pnuts("gaussian", y ~ x, data = dat)
 gaussian_stats <- check_fit(gaussian, nrow(dat))
-expect_s3_class(loo(gaussian, cores = 1), "loo")
+expect_s3_class(loo(gaussian), "loo")
 restored <- readRDS(file.path(output, "gaussian.rds"))
 expect_equal(as_draws_array(restored), as_draws_array(gaussian))
 

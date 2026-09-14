@@ -66,6 +66,13 @@ posterior::summarise_draws(pnuts_diagnostics(fit))
 `backend = "pnuts"` is an equivalent spelling. `iter` includes discarded
 warmup, as in other brms backends. `cores` limits concurrently running chains;
 each native process evaluates gradients directly through BridgeStan.
+LOO post-processing defaults to one core, independently of the sampling
+`cores` setting and `options(mc.cores = ...)`. This allows `loo(fit)` to run
+in the Positron Console, which cannot fork R sessions. On an older version
+of this branch, use `loo(fit, cores = 1)` without resampling. Setting a
+`future::multisession()` plan alone does not change the loo package's
+parallel backend. Explicit `loo(fit, cores = n)` with `n > 1` still needs
+an R session that supports loo's parallel implementation.
 `thin` is applied when importing completed draws. `save_warmup = TRUE` enables
 `pnuts_diagnostics(fit, inc_warmup = TRUE)`. `refresh` is accepted for brms API
 compatibility; it does not control the native sampler's progress output.
@@ -146,6 +153,9 @@ supported. Very large fits also need enough R memory for the returned draws.
 `tests/testthat/tests.pnuts.R` covers dispatch, controls, initialization specs,
 CSV conversion (including one and five chains, saved warmup and thinning),
 native diagnostics, and refusal of partial or unfrozen output.
+`tests/testthat/tests.loo-cores.R` checks that matrix and pointwise LOO,
+PSIS and stored criteria work with forking disabled even when `mc.cores`
+is greater than one, and that explicit parallel requests are preserved.
 
 With the toolchain configured, run `tests/local/tests.pnuts.R` for real
 Gaussian, multilevel Gaussian and Bernoulli fits; a Gaussian comparison with
