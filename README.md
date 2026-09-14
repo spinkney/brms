@@ -4,6 +4,9 @@
 
 # brms
 
+This experimental branch adds **`engine = "pnuts"`** on top of PR #1911.
+See [PNUTS setup and examples](PNUTS.md).
+
 [![R-CMD-check](https://github.com/paul-buerkner/brms/workflows/R-CMD-check/badge.svg)](https://github.com/paul-buerkner/brms/actions)
 [![Coverage
 Status](https://codecov.io/github/paul-buerkner/brms/coverage.svg?branch=master)](https://app.codecov.io/github/paul-buerkner/brms?branch=master)

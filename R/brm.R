@@ -169,9 +169,15 @@
 #'   or \code{"fixed_param"} for sampling from fixed parameter
 #'   values. Can be set globally for the current \R session via the
 #'   \code{"brms.algorithm"} option (see \code{\link{options}}).
+#' @param engine Optional sampler engine. Setting \code{engine = "pnuts"}
+#'   selects the experimental native PNUTS backend through BridgeStan, equivalent
+#'   to \code{backend = "pnuts"}. Other non-NULL values are forwarded to the
+#'   selected backend. PNUTS requires a separately installed executable and
+#'   Python BridgeStan 2.9.x; see \code{\link{pnuts_diagnostics}}.
 #' @param backend Character string naming the package to use as the backend for
 #'   fitting the Stan model. Options are \code{"rstan"} (the default),
-#'   \code{"cmdstanr"}, \code{"stanr"}, or \code{"stanli"}. Can be set globally
+#'   \code{"cmdstanr"}, \code{"stanr"}, \code{"stanli"}, or the experimental
+#'   \code{"pnuts"}. Can be set globally
 #'   for the current \R session via the \code{"brms.backend"} option (see
 #'   \code{\link{options}}). Details on the \pkg{rstan} and \pkg{cmdstanr}
 #'   packages are available at \url{https://mc-stan.org/rstan/} and
@@ -476,7 +482,13 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
                 seed = NA, save_model = NULL, stan_model_args = list(),
                 file = NULL, file_compress = TRUE,
                 file_refit = getOption("brms.file_refit", "never"),
-                empty = FALSE, rename = TRUE, ...) {
+                empty = FALSE, rename = TRUE, engine = NULL, ...) {
+
+  if (!is.null(engine)) engine <- as_one_character(engine)
+  if (is_equal(engine, "pnuts")) backend <- "pnuts"
+  if (backend == "pnuts" && !is.null(engine) && engine != "pnuts") {
+    stop2("Backend 'pnuts' requires engine = 'pnuts' or NULL.")
+  }
 
   # optionally load brmsfit from file
   # Loading here only when we should directly load the file.
@@ -485,6 +497,9 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
   if (!is.null(file) && file_refit == "never") {
     x <- read_brmsfit(file)
     if (!is.null(x)) {
+      if (backend == "pnuts" && x$backend != "pnuts") {
+        stop2("The cached fit was not sampled with PNUTS. Use file_refit = 'always'.")
+      }
       return(x)
     }
   }
@@ -509,6 +524,9 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
 
   # initialize brmsfit object
   if (is.brmsfit(fit)) {
+    if (backend == "pnuts" && fit$backend != "pnuts") {
+      stop2("Changing an existing fit to PNUTS requires update(fit, engine = 'pnuts').")
+    }
     # re-use existing model
     x <- fit
     x$criteria <- list()
@@ -520,7 +538,7 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
           x_from_file, scode = stancode(x), sdata = sdata,
           data = x$data, algorithm = algorithm, silent = silent
         )
-        if (!needs_refit) {
+        if (!needs_refit && !(backend == "pnuts" && x_from_file$backend != "pnuts")) {
           return(x_from_file)
         }
       }
@@ -573,7 +591,7 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
       backend = backend, threads = threads, opencl = opencl,
       save_pars = save_pars, ranef = bframe$frame$re, family = family,
       basis = frame_basis(bframe, data = data),
-      stan_args = nlist(init, silent, control, stan_model_args, ...)
+      stan_args = nlist(init, silent, control, stan_model_args, engine, ...)
     )
     exclude <- exclude_pars(x, bframe = bframe)
     # generate Stan data before compiling the model to avoid
@@ -595,7 +613,7 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
           x_from_file, scode = model, sdata = sdata, data = data,
           algorithm = algorithm, silent = silent
         )
-        if (!needs_refit) {
+        if (!needs_refit && !(backend == "pnuts" && x_from_file$backend != "pnuts")) {
           return(x_from_file)
         }
       }
@@ -616,6 +634,7 @@ brm <- function(formula, data, family = gaussian(), prior = NULL,
     model, sdata, algorithm, backend, iter, warmup, thin, chains, cores,
     threads, opencl, init, exclude, control, future, seed, silent, ...
   )
+  if (!is.null(engine) && engine != "pnuts") fit_args$engine <- engine
   x$fit <- do_call(fit_model, fit_args)
 
   # rename parameters to have human readable names

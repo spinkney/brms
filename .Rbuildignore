@@ -9,6 +9,7 @@
 ^\.github$
 ^.*\.Rprofile$
 ^README\.Rmd$
+^PNUTS\.md$
 ^README-.*\.png$
 ^\README_cache$
 ^cran-comments\.md$

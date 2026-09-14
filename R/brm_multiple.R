@@ -225,6 +225,9 @@ combine_models <- function(..., mlist = NULL, check_data = TRUE) {
   }
   sflist <- from_list(models, "fit")
   out <- models[[1]]
+  if (any(vapply(models, function(x) x$backend == "pnuts", logical(1)))) {
+    stop2("Combining PNUTS fits is not yet supported; retain separate fits and diagnostics.")
+  }
   out$fit <- rstan::sflist2stanfit(sflist)
   # fixes issue #1603
   out <- save_old_par_order(out, models[[1]])

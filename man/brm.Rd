@@ -46,6 +46,7 @@ brm(
   file_refit = getOption("brms.file_refit", "never"),
   empty = FALSE,
   rename = TRUE,
+  engine = NULL,
   ...
 )
 }
@@ -240,9 +241,16 @@ or \code{"fixed_param"} for sampling from fixed parameter
 values. Can be set globally for the current \R session via the
 \code{"brms.algorithm"} option (see \code{\link{options}}).}
 
+\item{engine}{Optional sampler engine. Setting \code{engine = "pnuts"}
+selects the experimental native PNUTS backend through BridgeStan, equivalent
+to \code{backend = "pnuts"}. Other non-NULL values are forwarded to the
+selected backend. PNUTS requires a separately installed executable and
+Python BridgeStan 2.9.x; see \code{\link{pnuts_diagnostics}}.}
+
 \item{backend}{Character string naming the package to use as the backend for
 fitting the Stan model. Options are \code{"rstan"} (the default),
-\code{"cmdstanr"}, \code{"stanr"}, or \code{"stanli"}. Can be set globally
+\code{"cmdstanr"}, \code{"stanr"}, \code{"stanli"}, or the experimental
+\code{"pnuts"}. Can be set globally
 for the current \R session via the \code{"brms.backend"} option (see
 \code{\link{options}}). Details on the \pkg{rstan} and \pkg{cmdstanr}
 packages are available at \url{https://mc-stan.org/rstan/} and

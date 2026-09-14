@@ -173,6 +173,7 @@ update.brmsfit <- function(object, formula., newdata = NULL,
   if (!"algorithm" %in% names(dots)) {
     dots$algorithm <- object$algorithm
   }
+  if (is_equal(dots$engine, "pnuts")) dots$backend <- "pnuts"
   if (!"backend" %in% names(dots)) {
     dots$backend <- object$backend
   }
@@ -213,6 +214,11 @@ update.brmsfit <- function(object, formula., newdata = NULL,
       dots$control[names(control)] <- control
       # reuse backend arguments originally passed to brm #1373
       names_old_stan_args <- setdiff(names(object$stan_args), names(dots))
+      if (object$backend == "pnuts") {
+        # Native output files have fixed chain names: each refit needs a fresh
+        # directory unless the user explicitly supplies a new output_dir.
+        names_old_stan_args <- setdiff(names_old_stan_args, "output_dir")
+      }
       dots[names_old_stan_args] <- object$stan_args[names_old_stan_args]
     }
   }

@@ -50,6 +50,9 @@ log_posterior.brmsfit <- function(object, ...) {
 #' @export
 nuts_params.brmsfit <- function(object, pars = NULL, ...) {
   contains_draws(object)
+  if (object$backend == "pnuts") {
+    stop2("PNUTS has no NUTS acceptance or divergence statistics; use pnuts_diagnostics().")
+  }
   bayesplot::nuts_params(object$fit, pars = pars, ...)
 }
 
@@ -108,7 +111,9 @@ control_params <- function(x, ...) {
 #' @export
 control_params.brmsfit <- function(x, pars = NULL, ...) {
   contains_draws(x)
-  if (x$backend == "cmdstanr" || is_stanr_backend(x$backend)) {
+  if (x$backend == "pnuts") {
+    out <- attr(x$fit, "pnuts")$control
+  } else if (x$backend == "cmdstanr" || is_stanr_backend(x$backend)) {
     # all three backends attach the same csfit-shaped list (see .stanfit_from_csfit)
     out <- attr(x$fit, "metadata")$metadata
   } else {

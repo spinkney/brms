@@ -527,6 +527,8 @@ compiled_model <- function(x) {
     out <- attributes(x$fit)$CmdStanModel
   } else if (is_stanr_backend(backend)) {
     out <- attributes(x$fit)$StanModel
+  } else if (backend == "pnuts") {
+    out <- attr(x$fit, "PNUTSModel")
   } else if (backend == "mock") {
     stop2("'compiled_model' is not supported in the mock backend.")
   }
@@ -547,6 +549,9 @@ needs_recompilation <- function(x) {
     # Always recompiling is fine: stanr's own $compile()
     # hits an on-disk hash cache and is a fast no-op when nothing changed
     out <- TRUE
+  } else if (backend == "pnuts") {
+    model <- attr(x$fit, "PNUTSModel")
+    out <- is.null(model) || !file.exists(model$library)
   } else if (backend == "mock") {
     out <- FALSE
   }
@@ -580,16 +585,24 @@ recompile_model <- function(x, recompile = NULL) {
   }
   message("Recompiling the Stan model")
   backend <- x$backend %||% "rstan"
-  new_model <- compile_model(
-    stancode(x), backend = backend, threads = x$threads,
+  compile_args <- if (backend == "pnuts") {
+    attr(x$fit, "PNUTSModel")$compile_args %||% list()
+  } else {
+    list()
+  }
+  compile_args <- c(compile_args, list(
+    model = stancode(x), backend = backend, threads = x$threads,
     opencl = x$opencl, silent = 2
-  )
+  ))
+  new_model <- do_call(compile_model, compile_args)
   if (backend == "rstan") {
     x$fit@stanmodel <- new_model
   } else if (backend == "cmdstanr") {
     attributes(x)$CmdStanModel <- new_model
   } else if (is_stanr_backend(backend)) {
     attributes(x$fit)$StanModel <- new_model
+  } else if (backend == "pnuts") {
+    attr(x$fit, "PNUTSModel") <- new_model
   } else if (backend == "mock") {
     stop2("'recompile_model' is not supported in the mock backend.")
   }
@@ -612,6 +625,9 @@ elapsed_time <- function(x) {
     rownames(out) <- NULL
   } else if (backend == "cmdstanr") {
     out <- attributes(x$fit)$metadata$time$chains
+  } else if (backend == "pnuts") {
+    out <- attr(x$fit, "metadata")$metadata$time
+    out$chain_id <- seq_len(nrow(out))
   } else if (is_stanr_backend(backend)) {
     # stanr only reports one aggregate wall-clock total for the whole fit
     csfit <- attributes(x$fit)$metadata
@@ -630,7 +646,7 @@ elapsed_time <- function(x) {
 
 # supported Stan backends
 backend_choices <- function() {
-  c("rstan", "cmdstanr", "stanr", "stanli", "mock")
+  c("rstan", "cmdstanr", "stanr", "stanli", "pnuts", "mock")
 }
 
 # supported Stan algorithms
@@ -1045,6 +1061,9 @@ read_csv_as_stanfit <- function(files, variables = NULL, sampler_diagnostics = N
 
   # some diagnostics may be missing in the output depending on the algorithm
   rstan_diagn_order <- intersect(rstan_diagn_order, names(diagnostics))
+  if (is_equal(csfit$metadata$engine, "pnuts")) {
+    rstan_diagn_order <- names(diagnostics)
+  }
 
   # convert to regular data.frame
   samples <- as.data.frame(samples)
@@ -1078,7 +1097,9 @@ read_csv_as_stanfit <- function(files, variables = NULL, sampler_diagnostics = N
 
   sampler_t <- NULL
   if (!is.null(values$algorithm)) {
-    if (values$algorithm == "rwm" || values$algorithm == "Metropolis") {
+    if (values$algorithm == "pnuts") {
+      sampler_t <- "PNUTS"
+    } else if (values$algorithm == "rwm" || values$algorithm == "Metropolis") {
       sampler_t <- "Metropolis"
     } else if (values$algorithm == "hmc") {
       if (values$engine == "static") {
@@ -1095,7 +1116,7 @@ read_csv_as_stanfit <- function(files, variables = NULL, sampler_diagnostics = N
     }
   }
 
-  adapt_info <- vector("list", 4)
+  adapt_info <- rep(list(character(0)), n_chains)
   idx_samples <- (n_iter_warmup + 1):(n_iter_warmup + n_iter_sample)
 
   for (i in seq_along(samples)) {

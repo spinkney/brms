@@ -540,6 +540,7 @@ family.brmsfit <- function(object, resp = NULL, ...) {
 #' @export
 expose_functions.brmsfit <- function(x, vectorize = FALSE,
                                      env = globalenv(), ...) {
+  if (x$backend == "pnuts") stop2("Exposing Stan functions is not supported by PNUTS.")
   vectorize <- as_one_logical(vectorize)
   stanmodel <- compiled_model(x)
   if (x$backend == "cmdstanr") {
